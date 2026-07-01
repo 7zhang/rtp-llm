@@ -45,6 +45,8 @@ struct CustomConfig {
     bool                                    reuse_cache        = false;
     DataType                                kv_cache_data_type = DataType::TYPE_FP16;
     std::map<std::string, std::vector<int>> multi_task_prompt_tokens;
+
+    bool enable_model_inputs_log = false;
 };
 
 inline void setDefaultMhaKVCacheSpecDescs(rtp_llm::ModelConfig& model_config) {
@@ -142,6 +144,9 @@ rtp_llm::EngineInitParams createEngineInitParams(const CustomConfig&     config,
     rtp_llm::GrpcConfig                  grpc_config;
     rtp_llm::FfnDisAggregateConfig       ffn_disaggregate_config;
     rtp_llm::VitConfig                   vit_config;
+
+    profiling_debug_logging_config.enable_model_inputs_log = config.enable_model_inputs_log;
+    profiling_debug_logging_config.log_file_backup_count   = 16;
 
     rtp_llm::EngineInitParams rtp_llm_params(0,
                                              model_config,

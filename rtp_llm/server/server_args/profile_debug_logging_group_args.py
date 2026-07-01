@@ -120,3 +120,14 @@ def init_profile_debug_logging_group_args(parser, profiling_debug_config):
         default=False,
         help="控制是否check nan, 为了排查。可选值: True (启用), False (禁用)。默认为 False",
     )
+    profile_debug_logging_group.add_argument(
+        "--enable_model_inputs_log",
+        env_name="ENABLE_MODEL_INPUTS_LOG",
+        bind_to=(profiling_debug_config, "enable_model_inputs_log"),
+        type=str2bool,
+        default=False,
+        help=(
+            "是否尽力将每次 forward 的原始输入写入 LOG_PATH/model_inputs；过载时会丢弃并记录 gap。内容可能包含 "
+            "token、embedding 和请求标识，仅排障时启用，文件仅进程 owner 可读且保留量受日志备份配置限制。默认为 False"
+        ),
+    )

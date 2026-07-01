@@ -1,4 +1,8 @@
 #include <memory>
+#include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include "torch/all.h"
 #include "gtest/gtest.h"
 
@@ -32,6 +36,52 @@ struct MtpExecutorTestConfig {
     size_t  vocab_size_override    = 0;  // 0 means use vocab_size
     int64_t mm_position_ids_style  = 0;
     int     position_id_len_factor = 1;
+
+    bool enable_model_inputs_log = false;
+};
+
+std::vector<c10::impl::GenericDict> loadMtpModelInputRecords(const std::filesystem::path& dir) {
+    std::vector<std::filesystem::path>  paths;
+    std::vector<c10::impl::GenericDict> records;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (entry.path().extension() == ".pt") {
+            paths.push_back(entry.path());
+        }
+    }
+    std::sort(paths.begin(), paths.end());
+    for (const auto& path : paths) {
+        std::vector<char> record(std::filesystem::file_size(path));
+        std::ifstream     input(path, std::ios::binary);
+        input.read(record.data(), static_cast<std::streamsize>(record.size()));
+        EXPECT_TRUE(input.good());
+        records.push_back(torch::pickle_load(record).toGenericDict());
+    }
+    return records;
+}
+
+class ModelInputsDumpScope {
+public:
+    explicit ModelInputsDumpScope(int server_id) {
+        const auto unique_id = std::chrono::steady_clock::now().time_since_epoch().count();
+        dump_dir_ =
+            std::filesystem::temp_directory_path() / ("rtp_llm_model_inputs_mtp_test_" + std::to_string(unique_id));
+        std::filesystem::create_directories(dump_dir_);
+        setenv("LOG_PATH", dump_dir_.c_str(), 1);
+        setenv("FRONTEND_SERVER_ID", std::to_string(server_id).c_str(), 1);
+    }
+
+    ~ModelInputsDumpScope() {
+        std::filesystem::remove_all(dump_dir_);
+        unsetenv("LOG_PATH");
+        unsetenv("FRONTEND_SERVER_ID");
+    }
+
+    std::filesystem::path dumpDir() const {
+        return dump_dir_ / "model_inputs";
+    }
+
+private:
+    std::filesystem::path dump_dir_;
 };
 
 template<typename T>
@@ -319,7 +369,8 @@ public:
     }
 
     MtpExecutorComponents createMtpExecutorComponents(const MtpExecutorTestConfig& test_config) {
-        CustomConfig               config;
+        CustomConfig config;
+        config.enable_model_inputs_log = test_config.enable_model_inputs_log;
         ModelConfig                model_config;
         RuntimeConfig              runtime_config;
         KVCacheConfig              kv_cache_config;
@@ -457,9 +508,12 @@ public:
 };
 
 TEST_F(MtpExecutorTest, testSingleBatchPrefill) {
+    ModelInputsDumpScope  dump_scope(23);
     MtpExecutorTestConfig test_config;
     test_config.gen_num_per_cycle = 4;
-    auto components               = createMtpExecutorComponents(test_config);
+
+    test_config.enable_model_inputs_log = true;
+    auto components                     = createMtpExecutorComponents(test_config);
 
     size_t batch_size = 1;
 
@@ -524,6 +578,16 @@ TEST_F(MtpExecutorTest, testSingleBatchPrefill) {
 
     // check stream result
     checkOutput(stream1, {0, 1, 2, 3, 1}, {1, 2}, {0.0, 0.0, 1.0, 0.0}, {0.17, 0.18});
+
+    components.executor.reset();
+    const auto records = loadMtpModelInputRecords(dump_scope.dumpDir());
+    ASSERT_EQ(records.size(), 2);
+    EXPECT_EQ(records[0].at("model_role").toStringRef(), "target");
+    EXPECT_EQ(records[1].at("model_role").toStringRef(), "draft");
+    EXPECT_EQ(records[0].at("execution_stage").toStringRef(), "prefill");
+    EXPECT_EQ(records[1].at("execution_stage").toStringRef(), "prefill");
+    EXPECT_EQ(toVec<int32_t>(records[0].at("combo_tokens").toTensor()), (vector<int32_t>{0, 1, 2, 3}));
+    EXPECT_EQ(toVec<int32_t>(records[1].at("combo_tokens").toTensor()), (vector<int32_t>{1, 2, 3, 1}));
 }
 
 TEST_F(MtpExecutorTest, testMultiBatchPrefill) {
@@ -616,10 +680,13 @@ TEST_F(MtpExecutorTest, testSingleBatchDecode) {
     size_t propose_step = 4;
     size_t vocab_size   = 4;
 
+    ModelInputsDumpScope  dump_scope(24);
     MtpExecutorTestConfig test_config;
     test_config.gen_num_per_cycle   = propose_step;
     test_config.vocab_size_override = 4;
-    auto components                 = createMtpExecutorComponents(test_config);
+
+    test_config.enable_model_inputs_log = true;
+    auto components                     = createMtpExecutorComponents(test_config);
 
     size_t batch_size = 1;
 
@@ -757,6 +824,22 @@ TEST_F(MtpExecutorTest, testSingleBatchDecode) {
 
     // check stream result
     checkOutput(stream1, {0, 1, 2, 3, 2, 0}, {0, 1}, {0.0, 1.0, 0.0, 0.0}, {0.3, 0.33});
+
+    components.executor.reset();
+    const auto records = loadMtpModelInputRecords(dump_scope.dumpDir());
+    ASSERT_EQ(records.size(), 5);
+    EXPECT_EQ(records[0].at("model_role").toStringRef(), "draft");
+    EXPECT_EQ(records[1].at("model_role").toStringRef(), "draft");
+    EXPECT_EQ(records[2].at("model_role").toStringRef(), "draft");
+    EXPECT_EQ(records[3].at("model_role").toStringRef(), "target");
+    EXPECT_EQ(records[4].at("model_role").toStringRef(), "draft_prefill");
+    EXPECT_EQ(records[3].at("execution_stage").toStringRef(), "target_verify");
+    EXPECT_EQ(records[4].at("execution_stage").toStringRef(), "prefill");
+    EXPECT_EQ(toVec<int32_t>(records[0].at("combo_tokens").toTensor()), (vector<int32_t>{3}));
+    EXPECT_EQ(toVec<int32_t>(records[1].at("combo_tokens").toTensor()), (vector<int32_t>{2}));
+    EXPECT_EQ(toVec<int32_t>(records[2].at("combo_tokens").toTensor()), (vector<int32_t>{1}));
+    EXPECT_EQ(toVec<int32_t>(records[3].at("combo_tokens").toTensor()), (vector<int32_t>{2, 3, 2, 1, 3}));
+    EXPECT_EQ(toVec<int32_t>(records[4].at("combo_tokens").toTensor()), (vector<int32_t>{3, 2, 0}));
 }
 
 TEST_F(MtpExecutorTest, testMultiBatchDecode) {
