@@ -226,7 +226,7 @@ def _register_builtin_lazy_models() -> None:
     register_lazy_model(
         "minimax_m3_eagle1",
         "rtp_llm.models.minimax_m3_eagle1",
-        ["MiniMaxM3Eagle1ForCausalLM", "LlamaForCausalLMEagle3"],
+        ["Qwen2ForCausalLMEagle1HASS"],
     )
     register_lazy_model("internlm", "rtp_llm.models.llama", ["InternLMForCausalLM"])
     register_lazy_model("internlm2", "rtp_llm.models.llama", ["InternLM2ForCausalLM"])

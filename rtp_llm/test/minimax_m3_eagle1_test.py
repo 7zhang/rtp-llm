@@ -1,82 +1,79 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 import torch
 
-from rtp_llm.models.minimax_m3_eagle1 import _eagle_d2t_offset_to_target_id
+from rtp_llm.models.minimax_m3_eagle1 import (
+    _external_lm_head_path,
+    _identity_d2t_map,
+    _load_external_lm_head,
+)
 from rtp_llm.models_py.model_desc.minimax_m3_eagle1 import MiniMaxM3Eagle1Model
 from rtp_llm.models_py.modules.factory.attention.common import (
     target_verify_block_table_for_token_rows,
 )
 
 
-class EagleD2TMappingTest(unittest.TestCase):
-    def test_sparse_offset_map_is_converted_to_absolute_ids(self):
-        offsets = torch.tensor([0, 0, 0, 100, 0], dtype=torch.int64)
+class EagleIdentityMappingTest(unittest.TestCase):
+    def test_full_vocab_d2t_identity_map_is_generated_for_hass_checkpoint(self):
+        torch.testing.assert_close(
+            _identity_d2t_map([], vocab_size=5),
+            torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64),
+        )
 
-        actual = _eagle_d2t_offset_to_target_id([offsets])
 
-        torch.testing.assert_close(actual, torch.tensor([0, 1, 2, 103, 4]))
-        torch.testing.assert_close(offsets, torch.tensor([0, 0, 0, 100, 0]))
+class EagleExternalLmHeadTest(unittest.TestCase):
+    def test_loads_lm_head_from_bundle_assets_sibling(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            ckpt = root / "draft_model"
+            assets = root / "assets"
+            ckpt.mkdir()
+            assets.mkdir()
+            expected = torch.randn(3, 4, dtype=torch.bfloat16)
+            torch.save(expected, assets / "lm_head.pt")
 
-    def test_absolute_map_is_preserved(self):
-        absolute = torch.tensor([10, 11, 12, 13, 14], dtype=torch.int64)
-
-        actual = _eagle_d2t_offset_to_target_id([absolute])
-
-        torch.testing.assert_close(actual, absolute)
-
-    def test_single_entry_map_is_preserved(self):
-        mapping = torch.tensor([7], dtype=torch.int32)
-
-        actual = _eagle_d2t_offset_to_target_id([mapping])
-
-        self.assertEqual(actual.dtype, torch.int64)
-        torch.testing.assert_close(actual, torch.tensor([7], dtype=torch.int64))
-
-    def test_rejects_non_vector_map(self):
-        with self.assertRaisesRegex(ValueError, "exactly one 1-D tensor"):
-            _eagle_d2t_offset_to_target_id([torch.zeros((2, 2), dtype=torch.int64)])
-
-    def test_rejects_multiple_maps(self):
-        with self.assertRaisesRegex(ValueError, "exactly one 1-D tensor"):
-            _eagle_d2t_offset_to_target_id(
-                [torch.zeros(2, dtype=torch.int64), torch.zeros(2, dtype=torch.int64)]
+            self.assertEqual(
+                _external_lm_head_path(str(ckpt)), str(assets / "lm_head.pt")
             )
+            actual = _load_external_lm_head([], ckpt_path=str(ckpt))
+            torch.testing.assert_close(actual, expected)
+
+    def test_rejects_missing_lm_head(self):
+        with TemporaryDirectory() as tmpdir:
+            ckpt = Path(tmpdir) / "draft_model"
+            ckpt.mkdir()
+            with self.assertRaisesRegex(FileNotFoundError, "external lm_head"):
+                _load_external_lm_head([], ckpt_path=str(ckpt))
 
 
 class EagleFcInputTest(unittest.TestCase):
-    def _draft(self, hidden_size: int, fc_input_width: int):
-        return SimpleNamespace(hidden_size=hidden_size, fc_input_width=fc_input_width)
-
-    def test_hidden_width_input_is_already_packed(self):
-        draft = self._draft(hidden_size=4, fc_input_width=4)
+    def test_hass_input_normalizes_embedding_and_hidden_before_projection(self):
+        draft = SimpleNamespace(
+            hidden_size=4,
+            embedding_norm=lambda value: value + 1,
+            hidden_norm=lambda value: value * 2,
+        )
         embedding = torch.randn(2, 4)
         hidden = torch.randn(2, 4)
-        actual = MiniMaxM3Eagle1Model._build_fc_input(draft, embedding, hidden)
-        self.assertIs(actual, hidden)
 
-    def test_double_width_concatenates_embedding_and_hidden(self):
-        draft = self._draft(hidden_size=4, fc_input_width=8)
-        embedding = torch.randn(2, 4)
-        hidden = torch.randn(2, 4)
         actual = MiniMaxM3Eagle1Model._build_fc_input(draft, embedding, hidden)
-        torch.testing.assert_close(actual, torch.cat([embedding, hidden], dim=-1))
 
-    def test_triple_width_uses_checkpoint_compatibility_layout(self):
-        draft = self._draft(hidden_size=4, fc_input_width=12)
-        embedding = torch.randn(2, 4)
-        hidden = torch.randn(2, 4)
-        actual = MiniMaxM3Eagle1Model._build_fc_input(draft, embedding, hidden)
         torch.testing.assert_close(
-            actual, torch.cat([embedding, hidden, hidden], dim=-1)
+            actual, torch.cat([embedding + 1, hidden * 2], dim=-1)
         )
 
-    def test_rejects_unsupported_fc_width(self):
-        draft = self._draft(hidden_size=4, fc_input_width=16)
-        with self.assertRaisesRegex(RuntimeError, "Unsupported MiniMax-M3 EAGLE1"):
+    def test_hass_input_rejects_wrong_target_hidden_width(self):
+        draft = SimpleNamespace(
+            hidden_size=4,
+            embedding_norm=lambda value: value,
+            hidden_norm=lambda value: value,
+        )
+        with self.assertRaisesRegex(RuntimeError, "HASS draft expected target hidden"):
             MiniMaxM3Eagle1Model._build_fc_input(
-                draft, torch.randn(2, 4), torch.randn(2, 4)
+                draft, torch.randn(2, 4), torch.randn(2, 5)
             )
 
 

@@ -14,7 +14,7 @@ from rtp_llm.model_loader.model_weight_info import (
     ModelWeightInfo,
 )
 from rtp_llm.model_loader.weight_module import AtomicWeight
-from rtp_llm.models.llama import Llama
+from rtp_llm.models.qwen_v2 import QWenV2
 from rtp_llm.utils.model_weight import (
     CkptWeightInfo,
     W,
@@ -27,58 +27,78 @@ from rtp_llm.utils.model_weight import (
 
 
 class MiniMaxM3Eagle1WeightNames:
-    WQ = "midlayer.self_attn.q_proj.weight"
-    WK = "midlayer.self_attn.k_proj.weight"
-    WV = "midlayer.self_attn.v_proj.weight"
-    WO = "midlayer.self_attn.o_proj.weight"
-    FFW1 = "midlayer.mlp.gate_proj.weight"
-    FFW2 = "midlayer.mlp.down_proj.weight"
-    FFW3 = "midlayer.mlp.up_proj.weight"
-    ATTEN_NORM = "midlayer.input_layernorm.weight"
-    FFN_NORM = "midlayer.post_attention_layernorm.weight"
-    HIDDEN_NORM = "midlayer.hidden_norm.weight"
+    WQ = "layers.{i}.self_attn.q_proj.weight"
+    WK = "layers.{i}.self_attn.k_proj.weight"
+    WV = "layers.{i}.self_attn.v_proj.weight"
+    BQ = "layers.{i}.self_attn.q_proj.bias"
+    BK = "layers.{i}.self_attn.k_proj.bias"
+    BV = "layers.{i}.self_attn.v_proj.bias"
+    WO = "layers.{i}.self_attn.o_proj.weight"
+    FFW1 = "layers.{i}.mlp.gate_proj.weight"
+    FFW2 = "layers.{i}.mlp.down_proj.weight"
+    FFW3 = "layers.{i}.mlp.up_proj.weight"
+    ATTEN_NORM = "layers.{i}.input_layernorm.weight"
+    FFN_NORM = "layers.{i}.post_attention_layernorm.weight"
+    HIDDEN_NORM = "h_norm.weight"
+    EMBEDDING_NORM = "e_norm.weight"
     TOKEN_EMBEDDING = "embed_tokens.weight"
     NORM = "norm.weight"
-    OUTPUT = "lm_head.weight"
-    FC = "fc.weight"
-    D2T = "d2t"
-    T2D = "t2d"
+    FC = "eh_proj.weight"
 
 
-def _merge_qkv_hf(ts: List[torch.Tensor], hidden_size, head_num_kv, head_num):
+def _merge_qkv_weight(ts: List[torch.Tensor]) -> torch.Tensor:
     q, k, v = ts
     return torch.concat([q.T, k.T, v.T], dim=1).contiguous()
 
 
-def _eagle_d2t_offset_to_target_id(ts: List[torch.Tensor]) -> torch.Tensor:
-    if len(ts) != 1 or ts[0].dim() != 1:
-        raise ValueError("MiniMax-M3 EAGLE1 d2t must contain exactly one 1-D tensor")
-    mapping = ts[0].to(torch.int64).contiguous()
-    if mapping.numel() <= 1:
-        return mapping
-    # Current MiniMax-M3 EAGLE1 checkpoints store a sparse offset map:
-    # identity entries are zero and only remapped draft ids are nonzero.
-    # Inspect the whole map so an early remapped id cannot be mistaken for an
-    # absolute map. This runs once while loading weights, outside inference.
-    zero_count = int((mapping == 0).sum().item())
-    looks_like_offset = zero_count * 2 > mapping.numel()
-    if not looks_like_offset:
-        return mapping
-    base = torch.arange(mapping.numel(), dtype=torch.int64, device=mapping.device)
-    return (base + mapping).contiguous()
+def _merge_qkv_bias(ts: List[torch.Tensor]) -> torch.Tensor:
+    q, k, v = ts
+    return torch.concat([q, k, v], dim=0).contiguous()
+
+
+def _identity_d2t_map(
+    _unused_tensors: List[torch.Tensor], vocab_size: int
+) -> torch.Tensor:
+    return torch.arange(vocab_size, dtype=torch.int64).contiguous()
+
+
+def _external_lm_head_path(ckpt_path: str) -> str:
+    return os.path.join(
+        os.path.dirname(os.path.abspath(ckpt_path)), "assets", "lm_head.pt"
+    )
+
+
+def _load_external_lm_head(
+    _unused_tensors: List[torch.Tensor], ckpt_path: str
+) -> torch.Tensor:
+    path = _external_lm_head_path(ckpt_path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            "MiniMax-M3 EAGLE1 HASS checkpoint requires external lm_head at " f"{path}"
+        )
+    try:
+        weight = torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        weight = torch.load(path, map_location="cpu")
+    if not isinstance(weight, torch.Tensor) or weight.dim() != 2:
+        raise ValueError(
+            "MiniMax-M3 EAGLE1 lm_head must be a 2-D tensor, " f"got {type(weight)}"
+        )
+    return weight.contiguous()
 
 
 class MiniMaxM3Eagle1WeightInfo(ModelDeployWeightInfo):
     def _process_meta(self, meta_dicts, weight_keys):
         if MiniMaxM3Eagle1WeightNames.FC not in weight_keys:
             raise Exception(
-                "unknown MiniMax-M3 EAGLE1 weights format: missing fc.weight"
+                "unsupported MiniMax-M3 EAGLE1 checkpoint: missing eh_proj.weight. "
+                "Only the HASS draft bundle format is supported."
             )
         self._names = MiniMaxM3Eagle1WeightNames
-        self._merge_qkv = _merge_qkv_hf
 
     def _get_weight_info(self):
         names = self._names
+        vocab_size = int(self.model_config.vocab_size)
         attn_config = AttnConfig(
             hidden_size=self._hidden_size,
             size_per_head=self._size_per_head,
@@ -108,19 +128,15 @@ class MiniMaxM3Eagle1WeightInfo(ModelDeployWeightInfo):
             ),
             AtomicWeight(
                 W.lm_head,
-                [CkptWeightInfo(names.OUTPUT, concat_0)],
-                identity,
+                [],
+                functools.partial(
+                    _load_external_lm_head, ckpt_path=self.model_config.ckpt_path
+                ),
             ),
             AtomicWeight(
                 W.multi_tokens_predict_d2t_map,
-                [CkptWeightInfo(names.D2T, identity)],
-                _eagle_d2t_offset_to_target_id,
-                data_type=torch.int64,
-            ),
-            AtomicWeight(
-                W.multi_tokens_predict_t2d_map,
-                [CkptWeightInfo(names.T2D, identity)],
-                identity,
+                [],
+                functools.partial(_identity_d2t_map, vocab_size=vocab_size),
                 data_type=torch.int64,
             ),
         ]
@@ -137,7 +153,7 @@ class MiniMaxM3Eagle1WeightInfo(ModelDeployWeightInfo):
             ),
             AtomicWeight(
                 W.multi_tokens_predict_enorm,
-                [CkptWeightInfo(names.ATTEN_NORM, identity)],
+                [CkptWeightInfo(names.EMBEDDING_NORM, identity)],
                 identity,
             ),
             AtomicWeight(
@@ -186,19 +202,26 @@ class MiniMaxM3Eagle1WeightInfo(ModelDeployWeightInfo):
                     CkptWeightInfo(names.WK, concat_0),
                     CkptWeightInfo(names.WV, concat_0),
                 ],
-                functools.partial(
-                    self._merge_qkv,
-                    hidden_size=self._hidden_size,
-                    head_num_kv=self._head_num_kv,
-                    head_num=self._head_num,
-                ),
+                _merge_qkv_weight,
                 config=attn_config,
             ),
         ]
+        layer_weights.append(
+            AttnAtomicWeight(
+                W.attn_qkv_b,
+                [
+                    CkptWeightInfo(names.BQ, identity),
+                    CkptWeightInfo(names.BK, identity),
+                    CkptWeightInfo(names.BV, identity),
+                ],
+                _merge_qkv_bias,
+                config=attn_config,
+            )
+        )
         return ModelWeightInfo(layer_weights=[layer_weights], weights=weights)
 
 
-class MiniMaxM3Eagle1(Llama):
+class MiniMaxM3Eagle1(QWenV2):
     @classmethod
     def _create_config(cls, ckpt_path: str) -> PyModelConfig:
         config = PyModelConfig()
@@ -210,7 +233,7 @@ class MiniMaxM3Eagle1(Llama):
             raise Exception("MiniMax-M3 EAGLE1 parameter from unknown source")
         with open(config_path) as reader:
             config_json = json.loads(reader.read())
-        Llama.from_huggingface(config, config_json)
+        QWenV2._from_config_json(config, config_json)
         rope_parameters = config_json.get("rope_parameters") or {}
         if "rope_theta" in rope_parameters:
             config.attn_config.rope_config.base = int(rope_parameters["rope_theta"])
@@ -245,5 +268,5 @@ class MiniMaxM3Eagle1(Llama):
 register_model(
     "minimax_m3_eagle1",
     MiniMaxM3Eagle1,
-    ["MiniMaxM3Eagle1ForCausalLM", "LlamaForCausalLMEagle3"],
+    ["Qwen2ForCausalLMEagle1HASS"],
 )

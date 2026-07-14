@@ -6,13 +6,7 @@ from torch import nn
 from rtp_llm.config.model_config import ModelConfig
 from rtp_llm.model_loader.model_weight_info import ModelWeights
 from rtp_llm.models_py.model_desc.module_base import GptModelBase
-from rtp_llm.models_py.modules import (
-    CausalAttention,
-    DenseMLP,
-    Embedding,
-    RMSNorm,
-    RMSResNorm,
-)
+from rtp_llm.models_py.modules import CausalAttention, DenseMLP, Embedding, RMSNorm
 from rtp_llm.models_py.modules.factory import LinearFactory
 from rtp_llm.ops import MoeConfig, ParallelismConfig
 from rtp_llm.ops.compute_ops import LayerKVCache, PyModelInputs, PyModelOutputs
@@ -33,10 +27,7 @@ class MiniMaxM3Eagle1DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(
             weights[W.pre_ln_gamma], eps=model_config.layernorm_eps
         )
-        self.hidden_norm = RMSNorm(
-            weights[W.multi_tokens_predict_hnorm], eps=model_config.layernorm_eps
-        )
-        self.post_attention_layernorm = RMSResNorm(
+        self.post_attention_layernorm = RMSNorm(
             weights[W.post_ln_gamma], eps=model_config.layernorm_eps
         )
         self.self_attn = CausalAttention(
@@ -58,23 +49,22 @@ class MiniMaxM3Eagle1DecoderLayer(nn.Module):
 
     def forward(
         self,
-        input_embeds: torch.Tensor,
         hidden_states: torch.Tensor,
         fmha_impl: Any,
         kv_cache: Optional[LayerKVCache],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        input_embeds = self.input_layernorm(input_embeds)
+    ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states = self.hidden_norm(hidden_states)
-        hidden_states = torch.cat([input_embeds, hidden_states], dim=-1)
+        hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             fmha_impl=fmha_impl,
             kv_cache=kv_cache,
         )
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        return residual + hidden_states
 
 
 class MiniMaxM3Eagle1Model(GptModelBase):
@@ -113,6 +103,25 @@ class MiniMaxM3Eagle1Model(GptModelBase):
         fc_weight = weights.weights[0][W.multi_tokens_predict_eh_proj]
         self.fc_input_width = int(fc_weight.shape[0])
         self.hidden_size = int(model_config.hidden_size)
+        if self.fc_input_width != self.hidden_size * 2:
+            raise RuntimeError(
+                "MiniMax-M3 EAGLE1 HASS fc input width must be 2x hidden size, "
+                f"got {self.fc_input_width} for hidden size {self.hidden_size}"
+            )
+        attn_input_width = int(weights.weights[0][W.attn_qkv_w].shape[0])
+        if attn_input_width != self.hidden_size:
+            raise RuntimeError(
+                "MiniMax-M3 EAGLE1 HASS attention input width must be hidden size, "
+                f"got {attn_input_width} for hidden size {self.hidden_size}"
+            )
+        self.embedding_norm = RMSNorm(
+            weights.weights[0][W.multi_tokens_predict_enorm],
+            eps=model_config.layernorm_eps,
+        )
+        self.hidden_norm = RMSNorm(
+            weights.weights[0][W.multi_tokens_predict_hnorm],
+            eps=model_config.layernorm_eps,
+        )
         self.layers = nn.ModuleList(
             [
                 MiniMaxM3Eagle1DecoderLayer(
@@ -124,7 +133,7 @@ class MiniMaxM3Eagle1Model(GptModelBase):
                 )
             ]
         )
-        self.norm = RMSResNorm(
+        self.norm = RMSNorm(
             weights.get_global_weight(W.final_ln_gamma), eps=model_config.layernorm_eps
         )
 
@@ -146,6 +155,8 @@ class MiniMaxM3Eagle1Model(GptModelBase):
         clone.fc = self.fc
         clone.fc_input_width = self.fc_input_width
         clone.hidden_size = self.hidden_size
+        clone.embedding_norm = self.embedding_norm
+        clone.hidden_norm = self.hidden_norm
         clone.layers = self.layers
         clone.norm = self.norm
         return clone
@@ -153,27 +164,14 @@ class MiniMaxM3Eagle1Model(GptModelBase):
     def _build_fc_input(
         self, input_embeds: torch.Tensor, target_hidden: torch.Tensor
     ) -> torch.Tensor:
-        hidden_width = int(target_hidden.shape[-1])
-        if hidden_width == self.fc_input_width:
-            return target_hidden
-        if hidden_width != self.hidden_size:
+        if int(target_hidden.shape[-1]) != self.hidden_size:
             raise RuntimeError(
-                "MiniMax-M3 EAGLE1 draft expected target hidden width "
-                f"{self.hidden_size} or prepacked fc width {self.fc_input_width}, "
-                f"got {hidden_width}"
+                "MiniMax-M3 EAGLE1 HASS draft expected target hidden width "
+                f"{self.hidden_size}, got {int(target_hidden.shape[-1])}"
             )
-        if self.fc_input_width == self.hidden_size * 2:
-            return torch.cat([input_embeds, target_hidden], dim=-1)
-        if self.fc_input_width == self.hidden_size * 3:
-            # Preserve the established checkpoint contract exactly. The three
-            # input partitions are token embedding, target final hidden, and the
-            # repeated target final hidden. This is a compatibility layout for
-            # the temporary checkpoint, not an EAGLE3 auxiliary-hidden layout.
-            compatibility_parts = (input_embeds, target_hidden, target_hidden)
-            return torch.cat(compatibility_parts, dim=-1)
-        raise RuntimeError(
-            f"Unsupported MiniMax-M3 EAGLE1 fc input width {self.fc_input_width} "
-            f"for hidden size {self.hidden_size}"
+        return torch.cat(
+            [self.embedding_norm(input_embeds), self.hidden_norm(target_hidden)],
+            dim=-1,
         )
 
     def forward(self, inputs: PyModelInputs, fmha_impl: Any = None) -> PyModelOutputs:
@@ -185,13 +183,11 @@ class MiniMaxM3Eagle1Model(GptModelBase):
             fmha_impl = self.prepare_fmha_impl(inputs)
         input_embeds = self.embed_tokens(input_ids)
         hidden_states = self.fc(self._build_fc_input(input_embeds, target_hidden))
-        residual = torch.zeros_like(hidden_states)
         for i, decoder_layer in enumerate(self.layers[: self.layer_num]):
-            hidden_states, residual = decoder_layer(
-                input_embeds,
+            hidden_states = decoder_layer(
                 hidden_states,
                 fmha_impl,
                 self.kv_cache.get_layer_cache(i) if self.kv_cache else None,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = self.norm(hidden_states)
         return PyModelOutputs(hidden_states, fmha_impl.fmha_params)
