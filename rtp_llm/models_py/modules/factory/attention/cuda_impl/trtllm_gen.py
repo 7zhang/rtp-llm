@@ -475,18 +475,20 @@ class FlashInferTRTLLMDecodeOp(object):
             return False
         # Note: this max q length is used for mtp decode verification.
         decode_kernel_max_q_len = 11
+        is_spec_decode = bool(getattr(attention_inputs, "is_target_verify", False))
         if (
-            attention_inputs.is_prefill
+            (attention_inputs.is_prefill or is_spec_decode)
             and attention_inputs.input_lengths[0] < decode_kernel_max_q_len
             and (attention_inputs.input_lengths == attention_inputs.input_lengths[0])
             .all()
             .item()
         ):
             return True
-        return not attention_inputs.is_prefill
+        return not attention_inputs.is_prefill and not is_spec_decode
 
     def prepare(self, attention_inputs: PyAttentionInputs) -> FlashInferTRTLLMParams:
-        if not attention_inputs.is_prefill:
+        is_spec_decode = bool(getattr(attention_inputs, "is_target_verify", False))
+        if not attention_inputs.is_prefill and not is_spec_decode:
             # need transfer to cuda, cuda graph can capture the add
             sequence_lengths = torch.ones_like(
                 attention_inputs.sequence_lengths,
@@ -689,7 +691,7 @@ class FlashInferTRTLLMSpecDecodeImpl(FMHAImplBase):
 
     def prepare_cuda_graph(self, attn_inputs: PyAttentionInputs):
         p = self._cg
-        if not attn_inputs.is_prefill:
+        if not bool(getattr(attn_inputs, "is_target_verify", False)):
             _prepare_cg_decode_kernel[p.grid](
                 attn_inputs.sequence_lengths_plus_1_d,
                 p.seq_lens,

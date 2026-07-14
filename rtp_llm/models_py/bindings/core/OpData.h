@@ -97,6 +97,11 @@ struct GptModelInputs {
     // To select correct inference mode, we need to set this flag manually.
     bool is_target_verify = false;
 
+    // Per-forward escape hatch for inputs whose dynamic shape is not covered by
+    // the model's captured CUDA graphs. The model instance and its buffers stay
+    // unchanged; only this invocation runs eagerly.
+    bool skip_cuda_graph = false;
+
     // MTP draft iteration marker for GLM-5.2 DSA top-k sharing:
     // -1: not an MTP draft iteration or unknown
     //  0: first draft step, compute and publish top-k indices

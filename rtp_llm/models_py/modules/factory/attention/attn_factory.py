@@ -19,6 +19,7 @@ from rtp_llm.utils.model_weight import W
 # Lists to store registered implementations
 PREFILL_MHA_IMPS: List[type[FMHAImplBase]] = []
 DECODE_MHA_IMPS: List[type[FMHAImplBase]] = []
+SPEC_DECODE_MHA_IMPS: List[type[FMHAImplBase]] = []
 PREFILL_MLA_IMPS: List[type[MlaImplBase]] = []
 DECODE_MLA_IMPS: List[type[MlaImplBase]] = []
 
@@ -34,13 +35,10 @@ def get_mla_impl(
     parallelism_config: Optional[ParallelismConfig] = None,
 ) -> MlaImplBase:
 
-    # MTP target-verify arrives with is_prefill=True (sequence_lengths is empty in
-    # MtpBatchStreamProcessor::prepareOneStepSpecDecodeModelInput) but it is really
-    # multi-token decode with prefix in cache — sglang/vllm both classify it as
-    # decode. If we let it go through the prefill path the fast-path branch below
-    # skips SparseMlaImpl, so the main (DSA) model uses dense MLA during verify and
-    # baseline (DSA decode) uses sparse MLA — different attention algorithms over
-    # the same KV cache → divergent main-model predictions and wrong response.
+    # Target verify is a multi-token decode over an existing KV prefix. Keep it on
+    # decode implementations even if a legacy caller also marks the input as prefill;
+    # selecting prefill attention here would change the target model algorithm during
+    # verification and can alter the final token distribution.
     is_target_verify = bool(getattr(attn_inputs, "is_target_verify", False))
 
     mla_impls = (
@@ -198,8 +196,13 @@ def get_fmha_impl(
 ) -> FMHAImplBase:
     # Set is_cuda_graph as dynamic attribute on attn_inputs for base class to read
     attn_inputs.is_cuda_graph = is_cuda_graph
-
-    mha_impls = PREFILL_MHA_IMPS if attn_inputs.is_prefill else DECODE_MHA_IMPS
+    is_target_verify = bool(getattr(attn_inputs, "is_target_verify", False))
+    if is_target_verify:
+        mha_impls = SPEC_DECODE_MHA_IMPS + DECODE_MHA_IMPS
+    elif attn_inputs.is_prefill:
+        mha_impls = PREFILL_MHA_IMPS
+    else:
+        mha_impls = DECODE_MHA_IMPS
 
     for impl in mha_impls:
         # Check if this FMHA implementation is disabled before creating instance
@@ -213,8 +216,10 @@ def get_fmha_impl(
         # that don't support CP — some impls (e.g. TRT) abort in support().
         # CP only splits the prefill sequence; decode runs standard attention,
         # so the prefill-CP gate must not reject decode impls when CP is enabled.
-        if attn_inputs.is_prefill and not impl.support_parallelism_config(
-            parallelism_config
+        if (
+            attn_inputs.is_prefill
+            and not is_target_verify
+            and not impl.support_parallelism_config(parallelism_config)
         ):
             continue
 
@@ -230,6 +235,14 @@ def get_fmha_impl(
             # If instantiation fails, continue to next impl
             logging.warning(f"Failed to instantiate {impl_class_name}: {e}")
             continue
+    logging.error(
+        f"can not find mha type: is_prefill={attn_inputs.is_prefill}, "
+        f"is_target_verify={is_target_verify}, is_cuda_graph={is_cuda_graph}, "
+        f"impls={[i.__name__ for i in mha_impls]}, "
+        f"all_spec_decode={[i.__name__ for i in SPEC_DECODE_MHA_IMPS]}, "
+        f"all_prefill={[i.__name__ for i in PREFILL_MHA_IMPS]}, "
+        f"all_decode={[i.__name__ for i in DECODE_MHA_IMPS]}"
+    )
     raise Exception(f"can not find mha type")
 
 

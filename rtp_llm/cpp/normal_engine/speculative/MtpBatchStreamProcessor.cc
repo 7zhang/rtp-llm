@@ -183,6 +183,8 @@ torch::Tensor makeCudaInt32Range(int64_t end) {
 }
 
 torch::Tensor committedLenToDraftDecodePosition(const torch::Tensor& committed_len, TensorHolder& host_holder) {
+    // next_seq_len is the committed length after the previous accept step.
+    // The next draft token is written at exactly that zero-based position.
     return toCudaInt32(committed_len, host_holder);
 }
 
@@ -201,11 +203,14 @@ void setVerifyPairInputs(GptModelInputs& model_input,
                          size_t          score_len,
                          TensorHolder&   host_holder) {
     model_input.combo_tokens       = std::move(combo_tokens);
-    model_input.sequence_lengths   = emptyInt32OnCuda({0});
     model_input.last_hidden_states = torch::Tensor();
     model_input.prefix_lengths     = toCudaInt32(model_input.prefix_lengths, host_holder).contiguous();
-    model_input.input_lengths      = fullInt32OnCuda({static_cast<int64_t>(batch_size)}, score_len);
-    model_input.lm_output_indexes  = makeCudaInt32Range(static_cast<int64_t>(batch_size * score_len));
+    // Target verify is decode-like at request level. Keep sequence_lengths aligned
+    // with prefix_lengths so generic post-layer code does not classify it as a
+    // prefill/context batch; per-token verify lengths are built separately.
+    model_input.sequence_lengths  = model_input.prefix_lengths;
+    model_input.input_lengths     = fullInt32OnCuda({static_cast<int64_t>(batch_size)}, score_len);
+    model_input.lm_output_indexes = makeCudaInt32Range(static_cast<int64_t>(batch_size * score_len));
 }
 
 torch::Tensor interleaveTokenPairs(const torch::Tensor& first, const torch::Tensor& second) {
@@ -424,6 +429,21 @@ MtpBatchStreamProcessor::gatherSpecSamplerInput(const StreamGroups&             
                           tensorDebugStringWithData<int32_t>(sampler_inputs.token_ids).c_str());
     }
 
+    if (!model_output.logits.defined()) {
+        return absl::InternalError("target verify output logits must be defined for speculative sampling");
+    }
+    if (model_output.logits.dim() != 2) {
+        return absl::InternalError(fmtstr("target verify logits must be 2-D, got dim=%ld", model_output.logits.dim()));
+    }
+    if (model_output.logits.size(0) != static_cast<int64_t>(total_batch_size)) {
+        return absl::InternalError(fmtstr("target verify logits row mismatch: rows=%ld expected=%zu "
+                                          "(stream_count=%zu score_len=%zu propose_step=%zu)",
+                                          model_output.logits.size(0),
+                                          total_batch_size,
+                                          stream_groups.size(),
+                                          score_len,
+                                          propose_step_));
+    }
     auto vocab_size           = (size_t)model_output.logits.size(1);
     sampler_inputs.vocab_size = vocab_size;
     if (return_all_probs != ReturnAllProbsMode::NONE) {
@@ -616,6 +636,10 @@ bool MtpBatchStreamProcessor::gatherMtpDecodeModelInputFromDeviceState(const Str
     auto pair_gpu                = interleaveTokenPairs(target_last_gpu, propose_gpu);
     auto next_seq_len_gpu_concat = torch::cat(next_seq_len_slices_gpu, 0);
 
+    // next_seq_len_gpu is the committed length after the previous accept step.
+    // Target verify replays the last committed token first, so the first verify
+    // token position is committed_len - 1. Later per-token lengths are derived
+    // from this prefix in PyWrappedModel.
     model_input.prefix_lengths = (next_seq_len_gpu_concat - 1).to(torch::kInt32);
     setVerifyPairInputs(model_input, std::move(pair_gpu), batch_size, propose_step_ + 1, host_holder);
     return true;
@@ -628,6 +652,8 @@ void MtpBatchStreamProcessor::prepareOneStepSpecDecodeModelInput(const StreamGro
     if (batch_size == 0) {
         return;
     }
+    RTP_LLM_CHECK_WITH_INFO(
+        propose_step_ == 1, "prepareOneStepSpecDecodeModelInput is EAGLE1-only: propose_step=%zu", propose_step_);
 
     if (gatherMtpDecodeModelInputFromDeviceState(stream_groups, model_input, host_holder)) {
         return;
@@ -651,10 +677,17 @@ void MtpBatchStreamProcessor::prepareOneStepSpecDecodeModelInput(const StreamGro
 
     auto target_last_gpu = torch::cat(target_last_slices, 0).to(torch::kInt32);
     auto propose_gpu     = torch::cat(propose_slices, 0).to(torch::kInt32);
+    auto verify_pairs    = interleaveTokenPairs(target_last_gpu, propose_gpu);
+    RTP_LLM_CHECK_WITH_INFO(verify_pairs.numel() == static_cast<int64_t>(batch_size * (propose_step_ + 1)),
+                            "one-step target verify token shape mismatch: tokens=%ld, batch=%zu, propose_step=%zu",
+                            verify_pairs.numel(),
+                            batch_size,
+                            propose_step_);
 
-    model_input.prefix_lengths = toCudaInt32(model_input.sequence_lengths, host_holder).clone();
-    setVerifyPairInputs(
-        model_input, interleaveTokenPairs(target_last_gpu, propose_gpu), batch_size, propose_step_ + 1, host_holder);
+    // Normal decode gatherer stores sequence_lengths as the current decode position
+    // (seqLength - 1), which is exactly the first target-verify token position.
+    model_input.prefix_lengths = toCudaInt32(model_input.sequence_lengths, host_holder).to(torch::kInt32);
+    setVerifyPairInputs(model_input, std::move(verify_pairs), batch_size, propose_step_ + 1, host_holder);
 }
 
 void MtpBatchStreamProcessor::updateDecodeDraftModelInput(GptModelInputs&        model_input,
@@ -734,19 +767,60 @@ void MtpBatchStreamProcessor::updateDecodePostDraftModelInput(
     const size_t                                 batch_size,
     torch::Tensor&                               hidden_states_d_t,
     TensorHolder&                                host_holder) {
-    // Keep dense accept_tokens for CUDA graph reuse; lm_output_indexes selects
-    // only the last accepted position. All outputs stay on CUDA so the next
-    // stream-async step can prepare without waiting for worker D2H.
-    int total_tokens = (propose_step_ + 1) * batch_size;
-    model_input.combo_tokens =
-        toCudaInt32(speculative_sampler_output.accept_tokens.reshape({(int64_t)total_tokens}), host_holder);
-    auto accept_len_d = toCudaInt32(speculative_sampler_output.accept_len, host_holder);
-    model_input.lm_output_indexes =
-        torch::arange(
-            0, total_tokens, propose_step_ + 1, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA))
-        + (accept_len_d - 1);
-    model_input.last_hidden_states = model_output.all_hidden_states;
-    hidden_states_d_t              = model_input.last_hidden_states;
+    // Keep all outputs on CUDA so the next stream-async step can prepare
+    // without waiting for worker D2H. Draft prefill itself uses a compact
+    // accepted-token layout to preserve its logical KV state after rejects.
+    const int total_tokens = (propose_step_ + 1) * batch_size;
+    RTP_LLM_CHECK_WITH_INFO(speculative_sampler_output.accept_len.defined(),
+                            "decode post-draft update requires accept_len");
+    RTP_LLM_CHECK_WITH_INFO(speculative_sampler_output.accept_tokens.defined(),
+                            "decode post-draft update requires accept_tokens");
+    RTP_LLM_CHECK_WITH_INFO(speculative_sampler_output.accept_len.numel() == static_cast<int64_t>(batch_size),
+                            "accept_len shape mismatch: numel=%ld, batch=%zu",
+                            speculative_sampler_output.accept_len.numel(),
+                            batch_size);
+    RTP_LLM_CHECK_WITH_INFO(speculative_sampler_output.accept_tokens.numel() == total_tokens,
+                            "accept_tokens shape mismatch: numel=%ld, expected=%d, batch=%zu, propose_step=%zu",
+                            speculative_sampler_output.accept_tokens.numel(),
+                            total_tokens,
+                            batch_size,
+                            propose_step_);
+    RTP_LLM_CHECK_WITH_INFO(model_output.all_hidden_states.defined(),
+                            "target verify output must carry all_hidden_states for draft prefill");
+    RTP_LLM_CHECK_WITH_INFO(model_output.all_hidden_states.dim() == 2
+                                && model_output.all_hidden_states.size(0) >= total_tokens,
+                            "target verify hidden shape mismatch: dim=%ld, rows=%ld, required_rows=%d",
+                            model_output.all_hidden_states.dim(),
+                            model_output.all_hidden_states.defined() && model_output.all_hidden_states.dim() > 0 ?
+                                model_output.all_hidden_states.size(0) :
+                                0,
+                            total_tokens);
+
+    auto accept_len_d    = toCudaInt32(speculative_sampler_output.accept_len, host_holder).contiguous();
+    auto accept_tokens_d = toCudaInt32(speculative_sampler_output.accept_tokens, host_holder)
+                               .reshape({(int64_t)batch_size, (int64_t)(propose_step_ + 1)});
+    auto token_pos =
+        torch::arange(0, propose_step_ + 1, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+    auto accept_mask = token_pos.unsqueeze(0) < accept_len_d.unsqueeze(1);
+
+    // Draft prefill must advance only by actually accepted tokens. Keeping the
+    // dense verify window here writes rejected/padded tokens into the draft KV
+    // cache and makes the next proposal depend on tokens that were not
+    // committed to the stream.
+    model_input.input_lengths     = accept_len_d;
+    model_input.combo_tokens      = accept_tokens_d.masked_select(accept_mask).contiguous();
+    model_input.lm_output_indexes = accept_len_d.cumsum(0).to(torch::kInt32) - 1;
+
+    const int64_t hidden_size = model_output.all_hidden_states.size(1);
+    auto          hidden_view =
+        model_output.all_hidden_states.reshape({(int64_t)batch_size, (int64_t)(propose_step_ + 1), hidden_size});
+    auto hidden_mask               = accept_mask.to(model_output.all_hidden_states.device());
+    model_input.last_hidden_states = hidden_view
+                                         .masked_select(hidden_mask.unsqueeze(-1).expand(
+                                             {(int64_t)batch_size, (int64_t)(propose_step_ + 1), hidden_size}))
+                                         .reshape({-1, hidden_size})
+                                         .contiguous();
+    hidden_states_d_t = model_input.last_hidden_states;
 }
 
 void MtpBatchStreamProcessor::updateOneStepDraftSamplerOutput(const StreamGroups& stream_groups,
@@ -948,7 +1022,7 @@ void MtpBatchStreamProcessor::prepareDecodeSpecUpdateInfo(
                                      torch::Tensor(),
                                      std::move(target_token_gpu)});
 
-        token_offset += propose_step_ + 1;
+        token_offset += cur_accept_len;
         batch_idx_in += cur_batch_size;
         batch_idx_out += next_batch_size;
     }

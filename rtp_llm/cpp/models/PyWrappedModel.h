@@ -353,16 +353,15 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
         } else {
             graph_params.num_tokens_per_bs = 1;
         }
-        // Target-model decode path with SP enabled (num_tokens_per_bs>1,
-        // not prefill-graph, model_id==0) must set is_target_verify so the
-        // Python dispatch routes through forward_decode.  NormalExecutor's
-        // decodeWarmUp path defaults use_spec_decoding=false but still sees
-        // sp_config enabled, so infer the flag from config instead of
-        // relying solely on the constructor arg.
-        const bool is_target_verify_decode = params.sp_config.type != SP_TYPE_NONE
-                                             && params.sp_config.gen_num_per_cycle > 0 && !params.model_id
-                                             && !is_prefill_cuda_graph_mode;
-        graph_params.is_target_verify = use_spec_decoding || is_target_verify_decode;
+        // In speculative generation the target model has no steady-state
+        // single-token decode stage: every post-prefill forward is target
+        // verify. It uses decode-style operators, but remains a distinct
+        // multi-token phase. Warmup may not pass use_spec_decoding, so infer
+        // this phase from the target-model configuration as well.
+        const bool configured_target_verify = params.sp_config.type != SP_TYPE_NONE
+                                              && params.sp_config.gen_num_per_cycle > 0 && !params.model_id
+                                              && !is_prefill_cuda_graph_mode;
+        graph_params.is_target_verify = use_spec_decoding || configured_target_verify;
         if (params.sp_config.type != SP_TYPE_NONE) {
             graph_params.sp_steps = params.sp_config.gen_num_per_cycle;
         }

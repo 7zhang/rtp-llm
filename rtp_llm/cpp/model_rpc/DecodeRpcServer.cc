@@ -1249,9 +1249,14 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
                                             mtp_model_id);
 
                     for (size_t layer_id = 0; layer_id < layer_num; layer_id++) {
-                        const bool mtp_use_hybrid          = mtp_cache_cfg.groupNums() > 1;
-                        const bool mtp_use_typed_regions   = mtp_cache_cfg.use_typed_cache_regions;
-                        const bool mtp_use_opaque_kv_store = mtp_cache_cfg.use_opaque_kv_cache_store;
+                        const bool mtp_use_hybrid        = mtp_cache_cfg.groupNums() > 1;
+                        const bool mtp_use_typed_regions = mtp_cache_cfg.use_typed_cache_regions;
+                        // The MTP/EAGLE module lives in the combined cache pool.
+                        // MiniMax-M3 EAGLE/MTP writes propose KV through the opaque cache-store path,
+                        // so decode-side remote load must accept the combined cache layout even if
+                        // the standalone draft sub-config was built as a plain K/V cache.
+                        const bool mtp_use_opaque_kv_store =
+                            mtp_cache_cfg.use_opaque_kv_cache_store || use_opaque_kv_store;
 
                         // Same multi-group iteration as the main path.
                         std::vector<int> mtp_layer_gids = layerGroupIds(mtp_cache_cfg, mtp_use_hybrid, layer_id);

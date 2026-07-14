@@ -628,14 +628,36 @@ class PyFlashinferDecodeAttnOp(object):
         else:  # BASE
             kv_datatype = get_scalar_type(attn_inputs.dtype)
 
-        # Steady-state decode drops the host metadata loop and H2D copy.
-        self.fmha_params.fill_params_mha_device(
-            self._prefix_lengths_for_decode(attn_inputs),
-            attn_inputs.sequence_lengths,
-            attn_inputs.input_lengths,
-            attn_inputs.kv_cache_kernel_block_id_device,
-            self.seq_size_per_block,
+        # Target verify is decode over token rows: each query sees the paged
+        # cache through its own end position. Initialize the fixed wrapper with
+        # that physical batch shape; replay only refreshes these buffers in place.
+        sequence_lengths_plus_1 = attn_inputs.sequence_lengths_plus_1_d
+        is_target_verify = (
+            bool(getattr(attn_inputs, "is_target_verify", False))
+            and sequence_lengths_plus_1 is not None
+            and sequence_lengths_plus_1.numel() > 0
         )
+        if is_target_verify:
+            block_table = common.target_verify_block_table_for_token_rows(
+                attn_inputs, attn_inputs.kv_cache_kernel_block_id_device
+            )
+            self.fmha_params.fill_params_mha_device(
+                torch.empty(
+                    0, dtype=torch.int32, device=sequence_lengths_plus_1.device
+                ),
+                sequence_lengths_plus_1 - 1,
+                torch.ones_like(sequence_lengths_plus_1),
+                block_table,
+                self.seq_size_per_block,
+            )
+        else:
+            self.fmha_params.fill_params_mha_device(
+                self._prefix_lengths_for_decode(attn_inputs),
+                attn_inputs.sequence_lengths,
+                attn_inputs.input_lengths,
+                attn_inputs.kv_cache_kernel_block_id_device,
+                self.seq_size_per_block,
+            )
         # Get torch.dtype from attention configs
         self.decode_wrapper.plan(
             self.fmha_params.decode_page_indptr_d,
@@ -662,9 +684,12 @@ class PyFlashinferDecodeAttnOp(object):
             and attn_inputs.sequence_lengths_plus_1_d is not None
             and attn_inputs.sequence_lengths_plus_1_d.numel() > 0
         ):
+            block_table = common.target_verify_block_table_for_token_rows(
+                attn_inputs, attn_inputs.kv_cache_kernel_block_id_device
+            )
             fill_decode(
                 attn_inputs.sequence_lengths_plus_1_d,
-                attn_inputs.kv_cache_kernel_block_id_device,
+                block_table,
                 self.seq_size_per_block,
             )
             return
@@ -785,3 +810,32 @@ class PyFlashinferDecodeImpl(FMHAImplBase):
 
         # Execute FMHA forward (decode attention reads K/V from the paged cache)
         return self.fmha_impl.forward(qkv, kv_cache, self.fmha_params)
+
+
+class PyFlashinferSpecDecodeImpl(PyFlashinferDecodeImpl):
+    """Decode-style paged-KV target verify for GPUs without TRTLLM-gen FMHA."""
+
+    def __init__(
+        self,
+        attn_configs: AttentionConfigs,
+        attn_inputs: PyAttentionInputs,
+        parallelism_config: Optional[ParallelismConfig] = None,
+    ) -> None:
+        super().__init__(attn_configs, attn_inputs, parallelism_config)
+        if self.need_rope_kv_cache:
+            # Multi-token verify needs the prefill writer, while replay metadata
+            # must retain the decode implementation's stable captured addresses.
+            self.rope_kvcache_impl = FusedRopeKVCachePrefillOpQNoTransposeOut(
+                attn_configs
+            )
+            self.rope_params = self.rope_kvcache_impl.prepare(attn_inputs)
+
+    @classmethod
+    def support(
+        cls, attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs
+    ) -> bool:
+        return (
+            bool(getattr(attn_inputs, "is_target_verify", False))
+            and not attn_configs.use_mla
+            and PyFlashinferDecodeImpl.support(attn_configs, attn_inputs)
+        )

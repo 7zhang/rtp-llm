@@ -25,6 +25,7 @@ from rtp_llm.models_py.modules.factory.attention.attn_factory import (
     DECODE_MLA_IMPS,
     PREFILL_MHA_IMPS,
     PREFILL_MLA_IMPS,
+    SPEC_DECODE_MHA_IMPS,
 )
 
 device_type = get_device_type()
@@ -83,12 +84,14 @@ else:
                 PyFlashinferDecodeImpl,
                 PyFlashinferPagedPrefillImpl,
                 PyFlashinferPrefillImpl,
+                PyFlashinferSpecDecodeImpl,
             )
 
             py_flashinfer_impls = (
                 PyFlashinferPrefillImpl,
                 PyFlashinferPagedPrefillImpl,
                 PyFlashinferDecodeImpl,
+                PyFlashinferSpecDecodeImpl,
             )
         except (ImportError, AttributeError) as e:
             logging.warning("Skip Python FlashInfer MHA implementations: %s", e)
@@ -121,9 +124,11 @@ else:
 
         PREFILL_MHA_IMPS.extend(prefill_mha_impls)
         if trtllm_impls is not None:
-            PREFILL_MHA_IMPS.extend([trtllm_impls[0], trtllm_impls[1]])
+            SPEC_DECODE_MHA_IMPS.append(trtllm_impls[0])
+            PREFILL_MHA_IMPS.append(trtllm_impls[1])
             DECODE_MHA_IMPS.append(trtllm_impls[2])
         if py_flashinfer_impls is not None:
+            SPEC_DECODE_MHA_IMPS.append(py_flashinfer_impls[3])
             PREFILL_MHA_IMPS.extend([py_flashinfer_impls[0], py_flashinfer_impls[1]])
             DECODE_MHA_IMPS.append(py_flashinfer_impls[2])
         if xqa_impl is not None:

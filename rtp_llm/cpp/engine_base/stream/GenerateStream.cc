@@ -838,11 +838,35 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info) {
 
     sp_output_buffer_->hidden_states = update_info.draft_hidden_states;
     sp_output_buffer_->all_probs     = update_info.draft_token_probs;
-    // Cache the per-stream GPU propose tokens for the next decode step.
-    // PDFUSION path provides this; PD-disaggregate path leaves it undefined and
-    // readers fall back to the CPU `tokens` tensor.
-    sp_output_buffer_->propose_tokens_gpu = update_info.draft_token_gpu;
-    sp_output_buffer_->target_token_gpu   = update_info.target_token_gpu;
+
+    torch::Tensor draft_token_gpu  = update_info.draft_token_gpu;
+    torch::Tensor target_token_gpu = update_info.target_token_gpu;
+#if defined(USING_CUDA) || defined(USING_ROCM)
+    auto cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    if (!draft_token_gpu.defined() && update_info.draft_token >= 0) {
+        draft_token_gpu = torch::full({1, 1}, update_info.draft_token, cuda_i32);
+    }
+    if (!target_token_gpu.defined()) {
+        target_token_gpu = torch::full({1}, target_last_token, cuda_i32);
+    }
+#endif
+    // Cache per-stream GPU mirrors for the next decode step. The first MTP
+    // decode step may only provide the legacy CPU draft_token; build the mirror
+    // here so device-input paths do not consume an uninitialized zero buffer.
+    sp_output_buffer_->propose_tokens_gpu = draft_token_gpu;
+    sp_output_buffer_->target_token_gpu   = target_token_gpu;
+#if defined(USING_CUDA) || defined(USING_ROCM)
+    if (draft_token_gpu.defined()) {
+        MtpAsyncDeviceState state;
+        state.next_seq_len_gpu       = torch::full({1}, seqLength(), cuda_i32);
+        state.propose_tokens_gpu     = draft_token_gpu;
+        state.last_hidden_states_gpu = update_info.draft_hidden_states;
+        state.draft_all_probs_gpu    = update_info.draft_token_probs;
+        state.last_real_seq_len      = seqLength();
+        state.next_real_seq_len      = seqLength();
+        setMtpAsyncDeviceState(std::move(state));
+    }
+#endif
 
     // for spec-decode linear attention, we need to adjust cache blocks
     int nxt_cached_len   = seqLength() - 1;

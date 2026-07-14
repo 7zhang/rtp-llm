@@ -826,6 +826,8 @@ def _write_decode_kv_idx_kernel(
     BASE_S2: tl.constexpr,
     BASE_S3: tl.constexpr,
     BASE_S4: tl.constexpr,
+    MAX_PHYSICAL_BLOCKS: tl.constexpr,
+    MAX_BLOCKS_PER_ROW: tl.constexpr,
     BLOCK_KV: tl.constexpr,
     BLOCK_IDX: tl.constexpr,
 ):
@@ -836,19 +838,26 @@ def _write_decode_kv_idx_kernel(
     prefix = seq_len - 1
     block_idx = prefix // PAGE_SIZE
     block_off = prefix - block_idx * PAGE_SIZE
+    valid_block_idx = (
+        (token < TOKEN_COUNT)
+        & (seq_len > 0)
+        & (block_idx >= 0)
+        & (block_idx < MAX_BLOCKS_PER_ROW)
+    )
     physical_block = tl.load(
         block_table_ptr + token * BT_STRIDE_B + block_idx * BT_STRIDE_BLK,
-        mask=(token < TOKEN_COUNT) & (seq_len > 0),
+        mask=valid_block_idx,
         other=-1,
     ).to(tl.int64)
+    valid_physical_block = (
+        valid_block_idx & (physical_block >= 0) & (physical_block < MAX_PHYSICAL_BLOCKS)
+    )
     physical_slot = physical_block * PAGE_SIZE + block_off
 
     offs = tl.arange(0, BLOCK_KV)
     head = offs // HEAD_DIM
     dim = offs - head * HEAD_DIM
-    kv_mask = (
-        (token < TOKEN_COUNT) & (physical_block >= 0) & (offs < NUM_KV_HEADS * HEAD_DIM)
-    )
+    kv_mask = valid_physical_block & (offs < NUM_KV_HEADS * HEAD_DIM)
     k_vals = tl.load(
         k_ptr + token * NUM_KV_HEADS * HEAD_DIM + offs,
         mask=kv_mask,
@@ -866,7 +875,7 @@ def _write_decode_kv_idx_kernel(
     tl.store(base_ptr + base_k + BASE_S1, v_vals, mask=kv_mask)
 
     idx_offs = tl.arange(0, BLOCK_IDX)
-    idx_mask = (token < TOKEN_COUNT) & (physical_slot >= 0) & (idx_offs < IDX_DIM)
+    idx_mask = valid_physical_block & (idx_offs < IDX_DIM)
     idx_vals = tl.load(
         idx_ptr + token * IDX_DIM + idx_offs,
         mask=idx_mask,
@@ -913,6 +922,8 @@ def _write_decode_kv_idx_to_paged(
         BASE_S2=int(base.stride(2)),
         BASE_S3=int(base.stride(3)),
         BASE_S4=int(base.stride(4)),
+        MAX_PHYSICAL_BLOCKS=int(base.shape[0]),
+        MAX_BLOCKS_PER_ROW=int(block_table.shape[1]),
         BLOCK_KV=triton.next_power_of_2(int(k.shape[1]) * int(k.shape[2])),
         BLOCK_IDX=triton.next_power_of_2(idx_dim),
     )
@@ -1577,6 +1588,18 @@ class MSAAttention(nn.Module):
         self._scratch_slots = 0
         self._paged_decode_static_ok: Optional[bool] = None
 
+    def _paged_kv_base_view(self, kv_cache: LayerKVCache) -> Optional[torch.Tensor]:
+        base = None if kv_cache is None else kv_cache.kv_cache_base
+        if base is None or base.dim() != 2:
+            return base
+        from rtp_llm.models_py.modules.factory.attention.common import (
+            reshape_paged_kv_cache,
+        )
+
+        return reshape_paged_kv_cache(
+            base, self.kv_head_num, self.page_size, self.head_dim
+        )
+
     def _check_paged_decode_static(self, kv_cache: LayerKVCache) -> bool:
         if (
             kv_cache is None
@@ -1586,7 +1609,7 @@ class MSAAttention(nn.Module):
         ):
             return False
 
-        base = kv_cache.kv_cache_base
+        base = self._paged_kv_base_view(kv_cache)
         scale = kv_cache.kv_scale_base
         if (
             base is None
@@ -1877,7 +1900,7 @@ class MSAAttention(nn.Module):
         """Token-major [block, page, head, dim] views of the standard HND paged
         pool [block, 2, head, page, head_dim] for K and V (non-contiguous views;
         fine for advanced-index read/write)."""
-        base = kv_cache.kv_cache_base
+        base = self._paged_kv_base_view(kv_cache)
         if base is None or base.dim() != 5:
             raise RuntimeError(
                 "MSA paged main K/V requires a 5-D paged cache "
@@ -1889,9 +1912,27 @@ class MSAAttention(nn.Module):
         return kpv, vpv
 
     def _physical_block_table(self, attn_inputs: PyAttentionInputs) -> torch.Tensor:
-        """Physical paged-cache block table (per-rank, CP-RR compact under
-        sharding). Mirrors the GLM5/DSV4 indexer: cache I/O must address the
-        physical pages, not the (possibly token-level) kernel block table."""
+        """Return this layer's physical paged-cache block table.
+
+        Hybrid cache groups own distinct physical tables. Resolve the owning
+        group locally without mutating the shared attention input object.
+        """
+        gid = 0
+        layer_to_group = getattr(attn_inputs, "kv_cache_layer_to_group", None)
+        if (
+            isinstance(layer_to_group, torch.Tensor)
+            and layer_to_group.numel() > self.layer_idx
+        ):
+            gid = int(layer_to_group[self.layer_idx].item())
+
+        physical_tables = getattr(
+            attn_inputs, "kv_cache_block_id_device_by_group", None
+        )
+        if physical_tables is not None and len(physical_tables) > gid:
+            physical_table = physical_tables[gid]
+            if isinstance(physical_table, torch.Tensor) and physical_table.numel() > 0:
+                return physical_table
+
         phys = getattr(attn_inputs, "kv_cache_block_id_device", None)
         if isinstance(phys, torch.Tensor) and phys.numel() > 0:
             return phys
@@ -2256,9 +2297,9 @@ class MSAAttention(nn.Module):
         # _check_paged_decode_static() has accepted the paged cache layout. Keep
         # the hot path to dynamic dtype checks; layout mismatches should fall back
         # before _forward_paged_decode() is selected.
-        base = kv_cache.kv_cache_base
+        base = self._paged_kv_base_view(kv_cache)
         scale = kv_cache.kv_scale_base
-        if base.dtype != k.dtype:
+        if base is None or scale is None or base.dtype != k.dtype:
             return None
 
         idx_view = scale.view(torch.bfloat16).view(
@@ -3101,7 +3142,6 @@ class MSAAttention(nn.Module):
                 "conditions are not satisfied."
             )
         paged_main_k, paged_main_v, phys_block_table, paged_idx_k = paged_decode_views
-
         if self._cuda_graph_forward_active():
             max_seqlen_k = self._cuda_graph_max_kv(attn_inputs)
         else:
@@ -3123,9 +3163,127 @@ class MSAAttention(nn.Module):
             phys_block_table=phys_block_table,
             paged_idx_k=paged_idx_k,
         )
+        attn_output = o.reshape(*input_shape, -1).contiguous()
+        output = self.o_proj(attn_output)
+        if self.tp_size > 1:
+            output = all_reduce(output, group=Group.TP)
+        return output
+
+    def _forward_target_verify_decode(
+        self,
+        hidden_states: torch.Tensor,
+        attn_inputs: PyAttentionInputs,
+        kv_cache: LayerKVCache,
+        x_fp8: Optional[torch.Tensor] = None,
+        x_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        from rtp_llm.models_py.triton_kernels.sparse_msa.minimax_sparse import (
+            minimax_paged_sparse_decode,
+        )
+
+        if self._paged_decode_static_ok is None:
+            self._paged_decode_static_ok = self._check_paged_decode_static(kv_cache)
+        if not self._paged_decode_static_ok:
+            raise RuntimeError(
+                "MSA target verify requires the paged decode cache layout"
+            )
+
+        input_shape = hidden_states.shape[:-1]
+        total_tokens = int(hidden_states.shape[0])
+        device = hidden_states.device
+        batch_size = int(attn_inputs.prefix_lengths.numel())
+        seq_lens_src = getattr(attn_inputs, "sequence_lengths_plus_1_d", None)
+        if batch_size <= 0 or total_tokens % batch_size != 0:
+            raise RuntimeError(
+                "MSA target verify expects flat [batch * verify_tokens, hidden] input; "
+                f"got tokens={total_tokens}, batch={batch_size}"
+            )
+        verify_tokens = total_tokens // batch_size
+
+        phys_block_table = self._physical_block_table(attn_inputs)
+        if int(phys_block_table.shape[0]) != batch_size:
+            raise RuntimeError(
+                "MSA target verify block table batch mismatch: "
+                f"block_table={tuple(phys_block_table.shape)}, batch={batch_size}"
+            )
+        phys_block_table = phys_block_table.repeat_interleave(verify_tokens, dim=0)
+
+        if (
+            isinstance(seq_lens_src, torch.Tensor)
+            and seq_lens_src.numel() >= total_tokens
+        ):
+            seq_lens = seq_lens_src[:total_tokens].to(device=device, dtype=torch.int32)
+            positions = torch.clamp(seq_lens.to(torch.int64) - 1, min=0).to(torch.int32)
+        else:
+            prefix = attn_inputs.prefix_lengths.to(device=device, dtype=torch.int64)
+            rel_pos = torch.arange(verify_tokens, device=device, dtype=torch.int64)
+            positions_i64 = (prefix[:, None] + rel_pos[None, :]).reshape(-1)
+            positions = positions_i64.to(torch.int32)
+            seq_lens = (positions_i64 + 1).to(torch.int32)
+        valid_token_mask = seq_lens > 0
+
+        if x_fp8 is not None and x_scale is not None:
+            qkv = self.qkv_proj(x_fp8, input_scales=x_scale)
+        else:
+            qkv = self.qkv_proj(hidden_states)
+        if self.qk_fuse_norm is not None:
+            qkv = self.qk_fuse_norm(qkv)
+        q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q = q.reshape(total_tokens, self.head_num, self.head_dim)
+        k = k.reshape(total_tokens, self.kv_head_num, self.head_dim)
+        v = v.reshape(total_tokens, self.kv_head_num, self.head_dim)
+
+        idx_q = F.linear(hidden_states, self.idx_q_w)
+        idx_k = F.linear(hidden_states, self.idx_k_w)
+        idx_q = idx_q.reshape(total_tokens, self.num_idx_heads, self.idx_head_dim)
+        idx_k = idx_k.reshape(total_tokens, 1, self.idx_head_dim)
+        idx_q = _gemma_rmsnorm_per_head(idx_q, self.idx_q_norm_w, self.layernorm_eps)
+        idx_k = _gemma_rmsnorm_per_head(idx_k, self.idx_k_norm_w, self.layernorm_eps)
+
+        q = q.contiguous()
+        k = k.contiguous()
+        self._apply_rope(q, k, positions)
+        idx_q = idx_q.contiguous()
+        idx_k = idx_k.contiguous()
+        self._apply_rope(idx_q, idx_k, positions)
+
+        paged_decode_views = self._write_kv_cache_and_idx_k_for_decode(
+            kv_cache, k, v, idx_k, seq_lens, phys_block_table
+        )
+        if paged_decode_views is None:
+            raise RuntimeError(
+                "MSA target verify requires BF16 paged K/V and idx_K scale storage"
+            )
+        paged_main_k, paged_main_v, phys_block_table, paged_idx_k = paged_decode_views
+
+        if self._cuda_graph_forward_active():
+            max_seqlen_k = self._cuda_graph_max_kv(attn_inputs)
+        else:
+            max_seqlen_k = int(seq_lens.max().item())
+        _idx_o, o = minimax_paged_sparse_decode(
+            q=q,
+            sink=None,
+            idx_q=idx_q,
+            seq_lens=seq_lens,
+            max_seqlen=max_seqlen_k,
+            block_size_k=self.block_size,
+            topk=self.topk_blocks,
+            init_blocks=self.init_blocks,
+            local_blocks=self.local_blocks,
+            score_type=self.score_type,
+            disable_index_value=self.disable_index_value,
+            paged_main_k=paged_main_k,
+            paged_main_v=paged_main_v,
+            phys_block_table=phys_block_table,
+            paged_idx_k=paged_idx_k,
+        )
+        o = torch.where(valid_token_mask[:, None, None], o, torch.zeros_like(o))
 
         attn_output = o.reshape(*input_shape, -1).contiguous()
         output = self.o_proj(attn_output)
+        output = torch.where(
+            valid_token_mask[:, None], output, torch.zeros_like(output)
+        )
         if self.tp_size > 1:
             output = all_reduce(output, group=Group.TP)
         return output
@@ -3148,6 +3306,15 @@ class MSAAttention(nn.Module):
         assert (
             attn_inputs.kv_cache_kernel_block_id_device is not None
         ), "MSAAttention requires a block table"
+
+        if bool(getattr(attn_inputs, "is_target_verify", False)):
+            return self._forward_target_verify_decode(
+                hidden_states,
+                attn_inputs,
+                kv_cache,
+                x_fp8=x_fp8,
+                x_scale=x_scale,
+            )
 
         if self._use_paged_decode_path(attn_inputs, kv_cache):
             return self._forward_paged_decode(

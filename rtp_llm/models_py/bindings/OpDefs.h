@@ -302,6 +302,7 @@ struct PyAttentionInputs {
     // Legacy CPU consumers still use singular kv_cache_kernel_block_id_host,
     // which aliases group 0.
     std::vector<torch::Tensor> kv_cache_kernel_block_id_device_by_group;
+    std::vector<torch::Tensor> kv_cache_block_id_device_by_group;
     torch::Tensor              kv_cache_layer_to_group;
     caffe2::TypeMeta           dtype;
     // Cumulative sequence lengths for attention kernels (e.g. FusedRopeKVCacheDecodeOp).

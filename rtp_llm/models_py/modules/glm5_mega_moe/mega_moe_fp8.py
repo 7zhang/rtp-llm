@@ -117,7 +117,7 @@ def _get_or_create_cuda_graph_clone_buf_fp8(src_buf, group, cfg: GLM5MegaMoeCfg)
         activation=_cfg_activation_name(cfg),
     )
     _CUDA_GRAPH_CLONE_FP8_BUF_CACHE[key] = cached
-    logging.info(
+    logger.info(
         "[MegaMoE FP8] allocated CUDA graph clone symm buffer: layer=%d "
         "max_tokens_per_rank=%d hidden=%d",
         cfg.layer_id,

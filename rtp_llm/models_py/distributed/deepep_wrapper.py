@@ -79,7 +79,6 @@ from rtp_llm.device.device_type import DeviceType, get_device_type
 from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
     MoEConfigAdapter,
 )
-from rtp_llm.ops import SpeculativeType
 
 __all__ = [
     "DeepepWrapperConfig",
@@ -733,8 +732,6 @@ def init_deepep_wrapper(
             getattr(engine_config.moe_config, "ll_num_max_token", 0)
             or engine_config.runtime_config.max_generate_batch_size
         )
-        if engine_config.sp_config.type != SpeculativeType.NONE:
-            ll_num_max_token *= engine_config.sp_config.gen_num_per_cycle + 1
         ll_num_max_token_per_rank = (
             DeepepWrapperConfig.calc_low_latency_max_token_per_rank(
                 ll_num_max_token,

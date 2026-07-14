@@ -96,6 +96,30 @@ torch::TensorOptions runtimeCudaI32Options() {
     return runtimeCudaOptions(torch::kInt32);
 }
 
+std::vector<torch::Tensor> physicalBlockTablesOnDevice(const torch::Tensor& block_ids, bool non_blocking) {
+    std::vector<torch::Tensor> tables;
+    if (!block_ids.defined()) {
+        return tables;
+    }
+    RTP_LLM_CHECK_WITH_INFO(block_ids.dim() == 2 || block_ids.dim() == 3, "kv_cache_block_id shape should be 2 or 3");
+    const size_t group_count = block_ids.dim() == 3 ? block_ids.size(0) : 1;
+    tables.reserve(group_count);
+    for (size_t group = 0; group < group_count; ++group) {
+        torch::Tensor table = block_ids.dim() == 3 ? block_ids[group] : block_ids;
+        if (table.dtype() != torch::kInt32) {
+            table = table.to(torch::kInt32);
+        }
+        if (!table.is_contiguous()) {
+            table = table.contiguous();
+        }
+        if (!table.is_cuda()) {
+            table = table.to(runtimeCudaI32Options(), non_blocking);
+        }
+        tables.push_back(std::move(table));
+    }
+    return tables;
+}
+
 void checkRuntimeCudaDevice(const torch::Tensor& tensor, const char* name) {
     if (!tensor.defined() || !tensor.is_cuda()) {
         return;
@@ -376,6 +400,9 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
     py_attn_inputs.prefix_lengths   = prefix_lengths;
     py_attn_inputs.sequence_lengths = sequence_lengths;
     py_attn_inputs.input_lengths    = input_lengths;
+    if (inputs.sequence_lengths_plus_1.defined()) {
+        py_attn_inputs.sequence_lengths_plus_1_d = to_device_i32(inputs.sequence_lengths_plus_1).contiguous();
+    }
 
     if (inputs.kv_cache_kernel_block_id.defined() && inputs.kv_cache_kernel_block_id.dim() != 3) {
         RTP_LLM_PROFILE_SCOPE("py_model.buildPyAttentionInputs(kv_kernel_block_host)");
@@ -393,36 +420,43 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
         py_attn_inputs.combo_position_ids = tensorHoldHostAndToCuda(inputs.combo_position_ids);
     }
 
-    // Calculate cu_seqlens
-    int    batch_size                 = py_attn_inputs.input_lengths.size(0);
-    size_t context_batch_size         = py_attn_inputs.prefix_lengths.size(0);
-    size_t decode_batch_size          = py_attn_inputs.sequence_lengths.size(0);
-    py_attn_inputs.dtype              = dataTypeToTorchType(description_.data_type);
-    py_attn_inputs.is_prefill         = !decode_batch_size;
     py_attn_inputs.is_target_verify   = inputs.is_target_verify;
     py_attn_inputs.mtp_iteration_step = inputs.mtp_iteration_step;
-    RTP_LLM_CHECK_WITH_INFO(
-        context_batch_size + decode_batch_size == batch_size,
-        "batch size check failed context_batch_size[%ld] decode_batch_size[%ld] total_batch_size[%ld]",
-        context_batch_size,
-        decode_batch_size,
-        batch_size);
 
-    // Defensive guard: PyWrappedModel currently does not support a mixed prefill+decode batch.
-    // The cu_seqlens slice assignment below assumes input_lengths.cumsum spans only context streams,
-    // but input_lengths actually has shape [decode + context]. When both are non-zero the sizes
-    // mismatch (slice=[context_batch_size] vs cumsum=[batch_size]) and copy_ throws an opaque
-    // PyTorch broadcast error. Failing here gives an actionable message and also catches any
-    // future scheduler regression that lets a mixed batch reach the python model path. Schedulers
-    // that talk to py_model are expected to drain decode before adding context (see
-    // FIFOScheduler::evaluateRunningBatch and GatherBatchScheduler::schedule's
-    // python_model_busy guard).
-    RTP_LLM_CHECK_WITH_INFO(context_batch_size == 0 || decode_batch_size == 0,
-                            "PyWrappedModel received a mixed prefill+decode batch which is not supported: "
-                            "context_batch_size[%ld] decode_batch_size[%ld]. The scheduler must keep prefill and "
-                            "decode batches separate when load_python_model is enabled.",
-                            context_batch_size,
-                            decode_batch_size);
+    // Calculate cu_seqlens
+    int    batch_size         = py_attn_inputs.input_lengths.size(0);
+    size_t context_batch_size = py_attn_inputs.prefix_lengths.size(0);
+    size_t decode_batch_size  = py_attn_inputs.sequence_lengths.size(0);
+    py_attn_inputs.dtype      = dataTypeToTorchType(description_.data_type);
+    if (py_attn_inputs.is_target_verify) {
+        context_batch_size        = 0;
+        decode_batch_size         = batch_size;
+        py_attn_inputs.is_prefill = false;
+    } else {
+        py_attn_inputs.is_prefill = !decode_batch_size;
+        RTP_LLM_CHECK_WITH_INFO(
+            context_batch_size + decode_batch_size == batch_size,
+            "batch size check failed context_batch_size[%ld] decode_batch_size[%ld] total_batch_size[%ld]",
+            context_batch_size,
+            decode_batch_size,
+            batch_size);
+
+        // Defensive guard: PyWrappedModel currently does not support a mixed prefill+decode batch.
+        // The cu_seqlens slice assignment below assumes input_lengths.cumsum spans only context streams,
+        // but input_lengths actually has shape [decode + context]. When both are non-zero the sizes
+        // mismatch (slice=[context_batch_size] vs cumsum=[batch_size]) and copy_ throws an opaque
+        // PyTorch broadcast error. Failing here gives an actionable message and also catches any
+        // future scheduler regression that lets a mixed batch reach the python model path. Schedulers
+        // that talk to py_model are expected to drain decode before adding context (see
+        // FIFOScheduler::evaluateRunningBatch and GatherBatchScheduler::schedule's
+        // python_model_busy guard).
+        RTP_LLM_CHECK_WITH_INFO(context_batch_size == 0 || decode_batch_size == 0,
+                                "PyWrappedModel received a mixed prefill+decode batch which is not supported: "
+                                "context_batch_size[%ld] decode_batch_size[%ld]. The scheduler must keep prefill and "
+                                "decode batches separate when load_python_model is enabled.",
+                                context_batch_size,
+                                decode_batch_size);
+    }
 
     if (context_batch_size > 0) {
         RTP_LLM_PROFILE_SCOPE("py_model.buildPyAttentionInputs(context_metadata)");
@@ -445,20 +479,40 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
         RTP_LLM_FAIL("device attention input metadata requires CUDA");
 #endif
     } else {
-        py_attn_inputs.total_tokens        = 0;
-        py_attn_inputs.cu_seqlens          = torch::zeros({batch_size + 1}, cuda_i32);
-        py_attn_inputs.cu_kv_seqlens       = torch::zeros({batch_size + 1}, cuda_i32);
-        py_attn_inputs.padding_offset      = torch::empty({0}, cuda_i32);
-        py_attn_inputs.decode_cu_seqlens_d = torch::arange(0, py_attn_inputs.sequence_lengths.size(0) + 1, 1, cuda_i32);
+        py_attn_inputs.total_tokens =
+            py_attn_inputs.is_target_verify && inputs.combo_tokens.defined() ? inputs.combo_tokens.size(0) : 0;
+        py_attn_inputs.cu_seqlens     = torch::zeros({batch_size + 1}, cuda_i32);
+        py_attn_inputs.cu_kv_seqlens  = torch::zeros({batch_size + 1}, cuda_i32);
+        py_attn_inputs.padding_offset = torch::empty({0}, cuda_i32);
+        if (py_attn_inputs.is_target_verify) {
+            auto zero = torch::zeros({1}, cuda_i32);
+            py_attn_inputs.decode_cu_seqlens_d =
+                torch::cat({zero, py_attn_inputs.input_lengths.cumsum(0, torch::kInt32)}, 0);
+            // Target verify is a multi-query decode batch. Dense attention
+            // consumes cu_seqlens as Q row boundaries, while decode-specific
+            // kernels consume decode_cu_seqlens_d. Share the device tensor so
+            // paged FMHA sees [0, verify_tokens, ...], not placeholder zeros.
+            py_attn_inputs.cu_seqlens = py_attn_inputs.decode_cu_seqlens_d;
+        } else {
+            py_attn_inputs.decode_cu_seqlens_d =
+                torch::arange(0, py_attn_inputs.sequence_lengths.size(0) + 1, 1, cuda_i32);
+        }
     }
 
-    // In qwen3-next target verify mode, sequence_lengths_plus_1_d uses prefix_lengths
+    // Target verify is flattened decode: sequence_lengths_plus_1_d stores per-token length after append.
     {
         RTP_LLM_PROFILE_SCOPE("py_model.buildPyAttentionInputs(sequence_lengths_plus_1)");
-        if (py_attn_inputs.is_target_verify && inputs.sequence_lengths_plus_1.defined()) {
-            py_attn_inputs.sequence_lengths_plus_1_d = to_device_i32(inputs.sequence_lengths_plus_1);
+        if (py_attn_inputs.is_target_verify && py_attn_inputs.sequence_lengths_plus_1_d.defined()) {
+            // Already provided by target-verify prepare.
         } else if (py_attn_inputs.is_target_verify) {
-            py_attn_inputs.sequence_lengths_plus_1_d = length_plus_one_device(prefix_lengths_src);
+            RTP_LLM_CHECK_WITH_INFO(batch_size > 0 && py_attn_inputs.total_tokens % batch_size == 0,
+                                    "target verify expects flat token count divisible by batch: tokens=%d batch=%d",
+                                    py_attn_inputs.total_tokens,
+                                    batch_size);
+            const int verify_tokens = py_attn_inputs.total_tokens / batch_size;
+            auto      rel_pos       = torch::arange(0, verify_tokens, 1, cuda_i32);
+            py_attn_inputs.sequence_lengths_plus_1_d =
+                (prefix_lengths.to(cuda_i32).unsqueeze(1) + rel_pos.unsqueeze(0) + 1).reshape({-1}).contiguous();
         } else {
             py_attn_inputs.sequence_lengths_plus_1_d = length_plus_one_device(sequence_lengths_src);
         }
@@ -574,6 +628,9 @@ void PyWrappedModel::setupKVCacheForAttentionInputs(torch_ext::PyAttentionInputs
 
     // Legacy 2-D device field defaults to group 0.
     py_attn_inputs.kv_cache_kernel_block_id_device = py_attn_inputs.kv_cache_kernel_block_id_device_by_group[0];
+
+    py_attn_inputs.kv_cache_block_id_device_by_group =
+        physicalBlockTablesOnDevice(inputs.kv_cache_block_id, /*non_blocking=*/true);
 
     // Gate host materialization: MHA reads device fields only, while MLA/
     // SparseMLA/ROCm/CP paths still consume the singular host block table.
@@ -705,9 +762,11 @@ GptModelOutputs PyWrappedModel::callForwardPostLayers(torch::Tensor         hidd
                                                       bool                  skip_final_layernorm,
                                                       size_t                num_valid_tokens) {
     RTP_LLM_PROFILE_SCOPE("py_model.callForwardPostLayers");
-    size_t num_input_tokens = num_valid_tokens != -1 ? num_valid_tokens : inputs.combo_tokens.size(0);
+    size_t     num_input_tokens = num_valid_tokens != -1 ? num_valid_tokens : inputs.combo_tokens.size(0);
+    const bool has_context_request =
+        !inputs.is_target_verify && inputs.input_lengths.size(0) != inputs.sequence_lengths.size(0);
     return forwardPostLayers(hidden_states,
-                             inputs.input_lengths.size(0) != inputs.sequence_lengths.size(0),
+                             has_context_request,
                              inputs.need_all_logits,
                              inputs.lm_output_indexes,
                              false,
@@ -991,7 +1050,7 @@ void PyWrappedModel::prepareAttentionInputs(const GptModelInputs& inputs, bool s
                                           attention_inputs_,
                                           torch_ext::BertEmbeddingInputs()});
 
-    if (enable_cuda_graph_ && graph_runner_->canRun(py_model_inputs, graph_state_)) {
+    if (enable_cuda_graph_ && !inputs.skip_cuda_graph && graph_runner_->canRun(py_model_inputs, graph_state_)) {
         RTP_LLM_PROFILE_SCOPE("py_model.prepareAttentionInputs(cuda_graph_prepare)");
         graph_runner_->prepareAttentionInputs(py_model_inputs, graph_state_, skip_forward_event_sync);
     }
@@ -1023,6 +1082,9 @@ void PyWrappedModel::updateKVCacheKernelBlockId(const GptModelInputs& inputs) {
         attention_inputs_.kv_cache_kernel_block_id_device_by_group.push_back(inputs.kv_cache_kernel_block_id[g]);
     }
     attention_inputs_.kv_cache_kernel_block_id_device = attention_inputs_.kv_cache_kernel_block_id_device_by_group[0];
+
+    attention_inputs_.kv_cache_block_id_device_by_group =
+        physicalBlockTablesOnDevice(inputs.kv_cache_block_id, /*non_blocking=*/false);
 
     if (inputs.kv_cache_block_id.defined()) {
         torch::Tensor physical_group0;
@@ -1153,7 +1215,7 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         torch::Tensor  hidden_states;
 
         // Cast the Python object to PyModelOutputs and extract hidden states
-        if (enable_cuda_graph_ && graph_runner_->canRun(py_model_inputs, graph_state_)) {
+        if (enable_cuda_graph_ && !inputs.skip_cuda_graph && graph_runner_->canRun(py_model_inputs, graph_state_)) {
             RTP_LLM_PROFILE_SCOPE("py_model.forward(cuda_graph)");
             DevicePerfWrapper wrapper(enable_device_perf_, "cuda graph python forward");
             RTP_LLM_LOG_DEBUG(

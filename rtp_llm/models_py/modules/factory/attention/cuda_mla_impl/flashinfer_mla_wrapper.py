@@ -32,8 +32,10 @@ def _select_mla_block_id_host(attn_inputs: PyAttentionInputs) -> torch.Tensor:
 def _select_mla_block_id_device(attn_inputs: PyAttentionInputs) -> torch.Tensor:
     block_id = getattr(attn_inputs, "kv_cache_block_id_device", None)
     if isinstance(block_id, torch.Tensor) and block_id.numel() > 0:
-        return block_id
-    return attn_inputs.kv_cache_kernel_block_id_device
+        return common.target_verify_block_table_for_token_rows(attn_inputs, block_id)
+    return common.target_verify_block_table_for_token_rows(
+        attn_inputs, attn_inputs.kv_cache_kernel_block_id_device
+    )
 
 
 class MlaFlashInferImplBase(MlaImplBase):
@@ -462,6 +464,6 @@ class MlaFlashInferDecodeImpl(MlaFlashInferImplBase):
                 block_id_device,
                 self.seq_size_per_block,
             )
-            self.fmha_impl.plan_cuda_graph(attn_inputs)
+            self.fmha_impl.plan_cuda_graph(attn_inputs, block_id_device)
             return
         self.prepare(attn_inputs, forbid_realloc=True)

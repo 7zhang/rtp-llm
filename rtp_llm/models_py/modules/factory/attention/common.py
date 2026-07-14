@@ -17,6 +17,46 @@ from rtp_llm.models_py.modules.base.common.kvcache_store import (
 from rtp_llm.ops.compute_ops import KVCache, LayerKVCache, PyAttentionInputs
 
 
+def target_verify_block_table_for_token_rows(
+    attn_inputs: PyAttentionInputs, block_table: torch.Tensor
+) -> torch.Tensor:
+    """Expand a request-row block table to one row per verify token."""
+    if not bool(getattr(attn_inputs, "is_target_verify", False)):
+        return block_table
+
+    token_lengths = getattr(attn_inputs, "sequence_lengths_plus_1_d", None)
+    request_lengths = getattr(attn_inputs, "prefix_lengths", None)
+    if (
+        not isinstance(token_lengths, torch.Tensor)
+        or not isinstance(request_lengths, torch.Tensor)
+        or not isinstance(block_table, torch.Tensor)
+        or token_lengths.numel() == 0
+        or request_lengths.numel() == 0
+        or block_table.dim() < 2
+    ):
+        return block_table
+
+    token_rows = int(token_lengths.numel())
+    request_rows = int(request_lengths.numel())
+    if token_rows % request_rows != 0:
+        raise RuntimeError(
+            "target verify token rows must be divisible by request rows: "
+            f"token_rows={token_rows}, request_rows={request_rows}"
+        )
+    if int(block_table.shape[0]) == token_rows:
+        return block_table
+    if int(block_table.shape[0]) != request_rows:
+        raise RuntimeError(
+            "target verify block table row mismatch: "
+            f"block_rows={int(block_table.shape[0])}, request_rows={request_rows}, "
+            f"token_rows={token_rows}"
+        )
+    if token_rows == request_rows:
+        return block_table
+    verify_tokens = token_rows // request_rows
+    return block_table.repeat_interleave(verify_tokens, dim=0).contiguous()
+
+
 def reshape_paged_kv_cache(
     paged_kv_cache: torch.Tensor,
     num_kv_heads: int,

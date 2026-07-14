@@ -970,17 +970,20 @@ class MlaFlashInferDecodeOp(object):
         self._fp8_prefill_sched_meta.num_splits = None
         return True
 
-    def plan_cuda_graph(self, attn_inputs: PyAttentionInputs) -> bool:
+    def plan_cuda_graph(
+        self,
+        attn_inputs: PyAttentionInputs,
+        block_table: Optional[torch.Tensor] = None,
+    ) -> bool:
         if not self._fp8_kv:
             return False
 
         sequence_lengths = attn_inputs.sequence_lengths_plus_1_d
         if sequence_lengths is None or sequence_lengths.numel() == 0:
             sequence_lengths = attn_inputs.sequence_lengths + 1
-        self._plan_fp8_from_device(
-            sequence_lengths,
-            attn_inputs.kv_cache_kernel_block_id_device,
-        )
+        if block_table is None:
+            block_table = attn_inputs.kv_cache_kernel_block_id_device
+        self._plan_fp8_from_device(sequence_lengths, block_table)
         return True
 
     def _plan_fp8_from_device(
