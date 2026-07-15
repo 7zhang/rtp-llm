@@ -2,8 +2,6 @@ import argparse
 import json
 import logging
 
-DEFAULT_DASH_SC_GRPC_MAX_SERVER_WORKERS = 4
-
 # Model RPC: receive / metadata limits (C++ GenerateStreamCall path).
 _MODEL_RPC_GRPC_RECV_AND_METADATA_BYTES = 1024 * 1024 * 1024
 
@@ -33,10 +31,7 @@ def default_model_grpc_config_json() -> str:
 
 
 def default_dash_sc_grpc_config_json() -> str:
-    """Same as ``default_model_grpc_config_json``, plus DashSc ``max_server_workers``."""
-    obj = json.loads(default_model_grpc_config_json())
-    obj["max_server_workers"] = DEFAULT_DASH_SC_GRPC_MAX_SERVER_WORKERS
-    return json.dumps(obj, separators=(",", ":"))
+    return default_model_grpc_config_json()
 
 
 def _grpc_config_from_json(grpc_config):
@@ -93,7 +88,6 @@ def init_dash_sc_grpc_group_args(parser, dash_sc_grpc_config):
         default=default_json,
         help=(
             "DashSc gRPC JSON: "
-            '{"client_config": {...}, "server_config": {...}, "max_server_workers": <int>}. '
-            "max_server_workers is ThreadPoolExecutor size for grpc.server."
+            '{"client_config": {...}, "server_config": {...}}.'
         ),
     )

@@ -853,6 +853,10 @@ class GrpcAccessRecord:
                 "multi_token_frame_count": self.multi_token_frame_count,
                 "max_tokens_per_frame": self.max_tokens_per_frame,
                 "generate_config": self.generate_config,
+                # Full token-id sequences are an intentional part of the
+                # frontend access-log contract for exact request replay and
+                # production diagnosis. Do not truncate, sample, hash, or
+                # default-disable them without changing that contract.
                 "input_ids": self.input_ids,
                 "generated_ids": self.generated_ids or None,
             }

@@ -1,3 +1,11 @@
+"""Opt-in process-wide debugging hooks shared by all RTP-LLM service roles.
+
+This runtime intentionally lives outside DashSc: main, frontend/backend, and
+DashSc processes use the same file-configured hooks so cross-process incidents
+can be diagnosed with one mechanism. It remains dormant unless
+``RTP_HOT_HOOK`` is explicitly enabled.
+"""
+
 import ctypes
 import functools
 import hashlib

@@ -7,7 +7,7 @@ import signal
 import socket
 import threading
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 from anyio import CapacityLimiter
 from anyio.lowlevel import RunVar
@@ -227,9 +227,37 @@ class GracefulShutdownServer(Server):
         try:
             await super().shutdown(sockets)
         finally:
-            await self.frontend_server.close()
-            if self.grpc_client is not None:
-                await self.grpc_client.close()
+            try:
+                await self._close_with_remaining_shutdown_budget(
+                    "frontend server", self.frontend_server.close
+                )
+            finally:
+                if self.grpc_client is not None:
+                    await self._close_with_remaining_shutdown_budget(
+                        "gRPC client", self.grpc_client.close
+                    )
+
+    async def _close_with_remaining_shutdown_budget(
+        self, name: str, close: Callable[[], Awaitable[None]]
+    ) -> None:
+        remaining = self._remaining_shutdown_timeout_after_pre_stop()
+        try:
+            close_awaitable = close()
+            if remaining is None:
+                await close_awaitable
+            else:
+                await asyncio.wait_for(close_awaitable, timeout=max(0.0, remaining))
+        except asyncio.TimeoutError:
+            if remaining is None:
+                logging.warning("Timed out closing %s", name, exc_info=True)
+            else:
+                logging.warning(
+                    "Timed out closing %s after remaining shutdown budget %.3fs",
+                    name,
+                    max(0.0, remaining),
+                )
+        except Exception as e:
+            logging.warning("Failed to close %s: %s", name, e, exc_info=True)
 
 
 class FrontendApp(object):

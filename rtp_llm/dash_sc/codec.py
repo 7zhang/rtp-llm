@@ -717,9 +717,9 @@ class SamplingParams:
             max_thinking_tokens=max_thinking_tokens,
             return_input_ids=return_input_ids,
             is_streaming=True,
-            # DashSC accepts structured-output inputs for API compatibility. The
-            # Model RPC path does not support xgrammar yet and intentionally omits
-            # these fields, so RPC requests currently use unconstrained generation.
+            # Preserve the parsed controls as rejection sentinels. Both the DashSC
+            # boundary and GenerateConfig.validate() fail before Model RPC until
+            # the backend can carry and execute the corresponding grammar state.
             response_format=self.response_format,
             json_format=self.json_format,
             structural_tag=self.structural_tag,
@@ -981,11 +981,7 @@ def _append_prompt_token_ids_output(
     prompt_token_ids: list[int],
 ) -> None:
     """``prompt_token_ids``: INT32 little-endian, shape ``[1, len]``."""
-    raw = (
-        struct.pack("<%di" % len(prompt_token_ids), *prompt_token_ids)
-        if prompt_token_ids
-        else struct.pack("<i", 0)
-    )
+    raw = struct.pack("<%di" % len(prompt_token_ids), *prompt_token_ids)
     out = infer.outputs.add()
     out.name = "prompt_token_ids"
     out.datatype = "INT32"
@@ -997,18 +993,8 @@ def _append_generated_ids_output(
     infer: predict_v2_pb2.ModelInferResponse,
     generated_ids: list[int],
 ) -> None:
-    """``generated_ids``: INT32 little-endian, shape ``[1, len]``.
-
-    When empty, a 4-byte filler (single INT32 ``0``) is appended because
-    ``raw_input_contents`` indices must stay aligned with ``outputs``. The consumer
-    side (access_log ``_scan_response_outputs``) checks declared ``shape`` so the
-    filler byte does not leak into token accumulators.
-    """
-    raw = (
-        struct.pack("<%di" % len(generated_ids), *generated_ids)
-        if generated_ids
-        else struct.pack("<i", 0)
-    )
+    """``generated_ids``: INT32 little-endian, shape ``[1, len]``."""
+    raw = struct.pack("<%di" % len(generated_ids), *generated_ids)
     out = infer.outputs.add()
     out.name = "generated_ids"
     out.datatype = "INT32"
@@ -1023,8 +1009,8 @@ def prepend_to_generated_ids_tensor(
     """Prepend ``token_ids`` to the already-appended ``generated_ids`` tensor on ``infer``.
 
     Returns ``False`` and leaves ``infer`` untouched when ``token_ids`` is empty, when
-    ``generated_ids`` is absent, or when its declared shape is a zero-length / filler
-    payload (``shape[-1] <= 0``). On success, re-packs the raw bytes as
+    ``generated_ids`` is absent, or when its declared shape is zero-length
+    (``shape[-1] <= 0``). On success, re-packs the raw bytes as
     ``token_ids + existing_ids`` (INT32 little-endian) and updates ``shape`` to
     ``[1, len(token_ids) + cur_len]``.
     """
@@ -1264,8 +1250,7 @@ def build_dash_error_response(
     infer.id = str(request_id)
     infer.model_name = model_name
 
-    # Do not append empty generated_ids/token_ids: Dash raw decode would see
-    # the filler 0 used by _append_generated_ids_output([]).
+    # A terminal business error has no token tensor; only append terminal metadata.
     _append_finish_reason_output(
         infer,
         finished=True,

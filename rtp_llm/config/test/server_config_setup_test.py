@@ -2,12 +2,41 @@ import unittest
 from unittest import TestCase
 from unittest.mock import patch
 
-from rtp_llm.config.py_config_modules import PyEnvConfigs
+from rtp_llm.config.py_config_modules import PyEnvConfigs, ServerConfig
 from rtp_llm.config.server_config_setup import (
     set_parallelism_config,
     setup_and_configure_server,
 )
 from rtp_llm.server.server_args.server_args import setup_args
+
+
+class ServerConfigPortLayoutTest(TestCase):
+    def test_dash_sc_rejects_legacy_stride_eight(self):
+        config = ServerConfig()
+        config.worker_info_port_num = 8
+
+        with self.assertRaisesRegex(ValueError, "must be at least 9"):
+            config.validate_port_layout(dash_sc_enabled=True)
+
+    def test_dash_sc_accepts_stride_nine_without_cross_rank_overlap(self):
+        config = ServerConfig()
+        config.worker_info_port_num = 9
+        config.validate_port_layout(dash_sc_enabled=True)
+
+        config.rank_id = 0
+        rank_zero_dash_sc_port = config.dash_sc_grpc_server_port
+        config.rank_id = 1
+        rank_one_server_port = config.server_port
+
+        self.assertEqual(rank_zero_dash_sc_port, config.start_port + 8)
+        self.assertEqual(rank_one_server_port, config.start_port + 9)
+        self.assertNotEqual(rank_zero_dash_sc_port, rank_one_server_port)
+
+    def test_vit_without_dash_sc_allows_legacy_stride(self):
+        config = ServerConfig()
+        config.worker_info_port_num = 8
+
+        config.validate_port_layout(dash_sc_enabled=False)
 
 
 class GenerateConfigTest(TestCase):

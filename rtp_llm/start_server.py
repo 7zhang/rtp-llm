@@ -67,7 +67,8 @@ def _backend_deferred_sigterm_seconds(py_env_configs: PyEnvConfigs) -> str:
     timeout = ProcessManager.normalize_shutdown_timeout_seconds(
         py_env_configs.server_config.shutdown_timeout
     )
-    return str(ProcessManager.deferred_group_shutdown_timeout_seconds(timeout))
+    deferred_timeout = ProcessManager.deferred_group_shutdown_timeout_seconds(timeout)
+    return "-1" if deferred_timeout is None else str(deferred_timeout)
 
 
 def _sync_server_shutdown_timeout(py_env_configs: PyEnvConfigs):
@@ -505,6 +506,10 @@ def start_server(py_env_configs: PyEnvConfigs):
             "Please migrate to ROLE_TYPE=VIT explicitly."
         )
         py_env_configs.role_config.role_type = RoleType.VIT
+
+    py_env_configs.server_config.validate_port_layout(
+        dash_sc_enabled=py_env_configs.role_config.role_type != RoleType.VIT
+    )
 
     # Initialize backend_process to None in case role_type is FRONTEND
     backend_process = None

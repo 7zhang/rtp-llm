@@ -105,6 +105,11 @@ class TestProcessManager(unittest.TestCase):
         self.assertFalse(self.manager.shutdown_requested)
         self.assertFalse(self.manager.failure_detected)
 
+    def test_init_preserves_infinite_shutdown_timeout(self):
+        manager = ProcessManager(shutdown_timeout=-1)
+        self.assertEqual(manager.shutdown_timeout, -1)
+        self.assertIsNone(manager._make_deadline(manager.shutdown_timeout))
+
     def test_add_single_process(self):
         """Test adding a single process"""
         proc = multiprocessing.Process(target=dummy_worker)
@@ -979,6 +984,28 @@ class TestFailureShutdownPaths(unittest.TestCase):
         self.assertFalse(manager.is_deferred_sigterm_pending())
         self.assertFalse(manager.failure_detected)
 
+    def test_infinite_timeout_defers_first_sigterm_without_fallback_timer(self):
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    DEFER_FIRST_SIGTERM_ENV: DEFER_FIRST_SIGTERM_VALUE,
+                    DEFER_FIRST_SIGTERM_SECONDS_ENV: "-1",
+                },
+            ),
+            patch("rtp_llm.utils.process_manager.threading.Timer") as timer_cls,
+        ):
+            manager = ProcessManager(
+                shutdown_timeout=-1,
+                monitor_interval=0.01,
+                allow_defer_first_sigterm=True,
+            )
+            manager._signal_handler(signal.SIGTERM, None)
+
+        timer_cls.assert_not_called()
+        self.assertFalse(manager.shutdown_requested)
+        self.assertTrue(manager.is_deferred_sigterm_pending())
+
     def test_deferred_backend_group_gets_staged_sigint(self):
         """Parent-staged backend shutdown must not look like duplicate
         cgroup SIGTERM noise to backend children."""
@@ -1211,8 +1238,15 @@ class TestFailureShutdownPaths(unittest.TestCase):
             self.assertEqual(ProcessManager.sync_shutdown_timeout_env(123), 123)
             self.assertEqual(os.environ[SHUTDOWN_TIMEOUT_ENV], "123")
 
-            self.assertEqual(ProcessManager.sync_shutdown_timeout_env(-1), 600)
-            self.assertEqual(os.environ[SHUTDOWN_TIMEOUT_ENV], "600")
+            self.assertEqual(ProcessManager.sync_shutdown_timeout_env(-1), -1)
+            self.assertEqual(os.environ[SHUTDOWN_TIMEOUT_ENV], "-1")
+
+    def test_shutdown_timeout_normalization_only_coerces_invalid_values(self):
+        self.assertEqual(ProcessManager.normalize_shutdown_timeout_seconds(-1), -1)
+        self.assertEqual(ProcessManager.normalize_shutdown_timeout_seconds(0), 600)
+        self.assertEqual(ProcessManager.normalize_shutdown_timeout_seconds(-2), 600)
+        self.assertEqual(ProcessManager.normalize_shutdown_timeout_seconds("bad"), 600)
+        self.assertIsNone(ProcessManager.deferred_group_shutdown_timeout_seconds(-1))
 
     def test_deferred_group_budget_includes_stop_timeout_headroom(self):
         """Parent backend wait must outlive the C++ gRPC stop timeout."""

@@ -60,7 +60,7 @@ def init_server_group_args(parser, server_config):
         bind_to=(server_config, "worker_info_port_num"),
         type=int,
         default=9,
-        help="worker的总的端口的数量",
+        help="rank 端口块步进；启用 DashSc gRPC 的非 VIT 服务最小为 9",
     )
     server_group.add_argument(
         "--shutdown_timeout",

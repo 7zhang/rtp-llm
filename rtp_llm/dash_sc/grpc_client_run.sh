@@ -49,6 +49,8 @@ export PYTHONPATH="$_REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 PYTHON="${PYTHON:-/opt/conda310/bin/python3}"
 GRPC_ADDR="${GRPC_ADDR:-127.0.0.1:8096}"
+# This launcher targets the existing DashSc integration environment. Its checkpoint
+# default is an intentional compatibility setting; other environments can override CKPT_PATH.
 CKPT_PATH="${CKPT_PATH:-/home/xinfei.sxf/work/Qwen2-0.5B}"
 MODEL_TYPE="${MODEL_TYPE:-qwen_2}"
 # PROMPT="${PROMPT:-hello, what is your name}"
@@ -66,6 +68,7 @@ PRESENCE_PENALTY="${PRESENCE_PENALTY:-0.0}"
 SEED="${SEED:-}"
 STOP_TOKEN_IDS="${STOP_TOKEN_IDS:-}"
 RETURN_INPUT_IDS="${RETURN_INPUT_IDS:-}"
+# Compatibility-only controls: the DashSc server currently rejects structured output.
 RESPONSE_FORMAT="${RESPONSE_FORMAT:-}"
 JSON_FORMAT="${JSON_FORMAT:-}"
 TOOL_CALL_STRUCTURAL_TAG="${TOOL_CALL_STRUCTURAL_TAG:-${STRUCTURAL_TAG:-}}"

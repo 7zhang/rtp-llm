@@ -446,12 +446,12 @@ def build_dash_sc_grpc_client_argparser() -> argparse.ArgumentParser:
         "--response_format",
         type=str,
         default="",
-        help='Optional JSON response_format, e.g. \'{"type":"json_object"}\'.',
+        help="Compatibility-only; DashSc currently rejects structured output.",
     )
     parser.add_argument(
         "--json_format",
         action="store_true",
-        help="Set request.parameters['json_format']=true.",
+        help="Compatibility-only; DashSc currently rejects structured output.",
     )
     parser.add_argument(
         "--tool_call_structural_tag",
@@ -459,7 +459,7 @@ def build_dash_sc_grpc_client_argparser() -> argparse.ArgumentParser:
         dest="structural_tag",
         type=str,
         default="",
-        help="Optional tool-call structural_tag JSON sent as request.parameters['tool_call_structural_tag'].",
+        help="Compatibility-only; DashSc currently rejects structured output.",
     )
     parser.add_argument(
         "--enable_thinking",
@@ -471,7 +471,7 @@ def build_dash_sc_grpc_client_argparser() -> argparse.ArgumentParser:
         "--dash_sc_grpc_config_json",
         type=str,
         default="",
-        help="Optional DashScGrpcConfig JSON (client_config / server_config / max_server_workers).",
+        help="Optional DashScGrpcConfig JSON (client_config / server_config).",
     )
     return parser
 

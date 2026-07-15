@@ -1202,10 +1202,11 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
         )
 
     async def close(self) -> None:
-        """Hook for teardown; currently holds no resources (backend_visitor is owned by
-        the caller, sequence counter is in-memory). Kept so future handles can be flushed
-        here without changing the call-site in ``DashScGrpcServer.stop``.
-        """
+        """Close the backend visitor owned by this servicer."""
+        backend_visitor = self._backend_visitor
+        self._backend_visitor = None
+        if backend_visitor is not None:
+            await backend_visitor.close()
 
     def _next_rtp_llm_request_id(self) -> int:
         sequence = self._seq_counter.increment() % 4096  # 12 bits
@@ -1242,6 +1243,26 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                     request.id,
                     request.model_name,
                 )
+                if not first_request:
+                    error_spec = DASH_ERROR_BAD_REQUEST
+                    resp = build_dash_error_response(
+                        str(request.id),
+                        request.model_name,
+                        error_spec=error_spec,
+                        status_message=(
+                            "multiple requests in one ModelStreamInfer stream are "
+                            "not supported; open a new stream for each request"
+                        ),
+                    )
+                    self._record_and_report_chunk(
+                        record,
+                        resp,
+                        delta_len=0,
+                        finished=True,
+                        finish_reason=error_spec.finish_reason,
+                    )
+                    yield resp
+                    return
                 try:
                     input_ids_list, sampling, other = parse_dash_sc_grpc_request(
                         request
@@ -1308,6 +1329,62 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                     await _send_partial_response_metadata(context)
                     partial_metadata_sent = True
 
+                if sampling is not None and sampling.num_return_sequences > 1:
+                    error_spec = DASH_ERROR_BAD_REQUEST
+                    resp = build_dash_error_response(
+                        str(request.id),
+                        request.model_name,
+                        error_spec=error_spec,
+                        status_message=(
+                            "num_return_sequences="
+                            f"{sampling.num_return_sequences} is not supported; "
+                            "DashSc ModelStreamInfer supports only one return sequence"
+                        ),
+                    )
+                    self._record_and_report_chunk(
+                        record,
+                        resp,
+                        delta_len=0,
+                        finished=True,
+                        finish_reason=error_spec.finish_reason,
+                    )
+                    yield resp
+                    return
+
+                if sampling is not None and (
+                    sampling.response_format is not None
+                    or sampling.json_format
+                    or sampling.structural_tag is not None
+                ):
+                    requested_controls = []
+                    if sampling.response_format is not None:
+                        requested_controls.append("response_format/guided_json")
+                    if sampling.json_format:
+                        requested_controls.append("json_format")
+                    if sampling.structural_tag is not None:
+                        requested_controls.append(
+                            "tool_call_structural_tag/structural_tag"
+                        )
+                    error_spec = DASH_ERROR_UNSUPPORTED
+                    resp = build_dash_error_response(
+                        str(request.id),
+                        request.model_name,
+                        error_spec=error_spec,
+                        status_message=(
+                            "structured output is not supported yet by DashSc "
+                            "ModelStreamInfer: " + ", ".join(requested_controls)
+                        ),
+                    )
+                    self._record_and_report_chunk(
+                        record,
+                        resp,
+                        delta_len=0,
+                        finished=True,
+                        finish_reason=error_spec.finish_reason,
+                    )
+                    yield resp
+                    return
+
                 if sampling is not None and sampling.max_new_tokens <= 0:
                     param_name = (
                         "max_completion_tokens"
@@ -1345,7 +1422,7 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                             finish_reason=LLMFinishReason.STOP,
                         )
                         yield resp
-                    return
+                    continue
                 else:
                     async for resp, stats in iter_real_model_stream_infer(
                         request,
@@ -1383,7 +1460,7 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                             prompt_cached_token_num=prompt_cached_token_num,
                         )
                         yield resp
-                    return
+                    continue
             if first_request:
                 record.mark_request_done("eof")
         except BaseException as e:

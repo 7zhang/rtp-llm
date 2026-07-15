@@ -40,9 +40,9 @@ class ProcessManager:
         monitor_interval: int = 1,
         allow_defer_first_sigterm: bool = False,
     ):
-        if shutdown_timeout <= 0:
+        if shutdown_timeout != -1 and shutdown_timeout <= 0:
             logging.warning(
-                f"shutdown_timeout={shutdown_timeout} is non-positive; "
+                f"shutdown_timeout={shutdown_timeout} is invalid; "
                 "coercing to 600s so the parent cannot hang on a "
                 "non-draining child."
             )
@@ -97,6 +97,12 @@ class ProcessManager:
 
         self._deferred_sigterm_seen = True
         delay_s = self._deferred_sigterm_delay_seconds()
+        if delay_s is None:
+            logging.info(
+                "Process manager deferring first SIGTERM indefinitely; waiting for "
+                "parent-staged backend shutdown"
+            )
+            return True
         logging.info(
             "Process manager deferring first SIGTERM for %.3fs; waiting for "
             "parent-staged backend shutdown",
@@ -108,12 +114,14 @@ class ProcessManager:
         timer.start()
         return True
 
-    def _deferred_sigterm_delay_seconds(self) -> float:
+    def _deferred_sigterm_delay_seconds(self) -> Optional[float]:
         raw = os.environ.get(DEFER_FIRST_SIGTERM_SECONDS_ENV, "")
         try:
             delay_s = float(raw) if raw else float(self.shutdown_timeout)
         except ValueError:
             delay_s = float(self.shutdown_timeout)
+        if delay_s == -1:
+            return None
         if delay_s <= 0:
             delay_s = 600.0
         return delay_s
@@ -398,6 +406,8 @@ class ProcessManager:
             timeout = int(shutdown_timeout)
         except (TypeError, ValueError):
             timeout = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
+        if timeout == -1:
+            return -1
         if timeout <= 0:
             timeout = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
         return timeout
