@@ -55,8 +55,6 @@ python -m rtp_llm.dash_sc.server --port 8000 \
   --dash_sc_grpc_config_json '{"client_config":{},"server_config":{},"max_server_workers":4}'
 ```
 
-若使用 Bazel 打出的 **`rtp_llm_dash_sc_grpc` wheel**，入口点为：`rtp-llm-dash-sc-grpc`（等价于上述模块的 `main`）。
-
 ## 配置：`--dash_sc_grpc_config_json` / `DASH_SC_GRPC_CONFIG_JSON`
 
 与 **Model RPC（C++）** 的 `--grpc_config_json` **相互独立**。DashSc 使用：

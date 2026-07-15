@@ -717,6 +717,9 @@ class SamplingParams:
             max_thinking_tokens=max_thinking_tokens,
             return_input_ids=return_input_ids,
             is_streaming=True,
+            # DashSC accepts structured-output inputs for API compatibility. The
+            # Model RPC path does not support xgrammar yet and intentionally omits
+            # these fields, so RPC requests currently use unconstrained generation.
             response_format=self.response_format,
             json_format=self.json_format,
             structural_tag=self.structural_tag,

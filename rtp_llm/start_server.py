@@ -530,6 +530,8 @@ def start_server(py_env_configs: PyEnvConfigs):
             )
             process_manager.add_processes(frontend_process, shutdown_group="frontend")
 
+            # DashSC is intentionally a mandatory companion of every non-VIT
+            # frontend deployment; its startup is not controlled by a feature flag.
             dash_sc_processes = start_dash_sc_server_impl(
                 global_controller, py_env_configs, process_manager
             )
