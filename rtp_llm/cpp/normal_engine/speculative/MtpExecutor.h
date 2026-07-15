@@ -101,6 +101,7 @@ protected:
     // preserves the original PROFILE_SCOPE labels.
     void            waitPreviousBookkeepingAndKvSwaps(const std::list<GenerateStreamPtr>& streams);
     void            prepareGrpcMtpDeviceState(const std::list<GenerateStreamPtr>& streams, TensorHolder& host_holder);
+    void            launchTargetVerifyPrepareAsync(const GptModelInputs& model_input, size_t batch_size);
     void            launchDraftPrefillPrepareAsync(const GptModelInputs& model_input);
     GptModelOutputs runTargetVerifyForward(GptModelInputs& model_input, const StreamGroups& stream_groups);
     void            debugCheckLinearBlockMapAtKernelRead(const GptModelInputs& model_input,
@@ -232,6 +233,7 @@ private:
     int64_t                       metrics_accept_len_stream_num_        = 0;
     int64_t                       metrics_accept_len_propose_token_num_ = 0;
 
+    AsyncRunner                             target_verify_prepare_runner_;
     AsyncRunner                             draft_prefill_prepare_runner_;
     AsyncRunner                             spec_logits_verify_async_runner_;
     std::unique_ptr<SpecLogitsVerifyRunner> spec_logits_verify_runner_;

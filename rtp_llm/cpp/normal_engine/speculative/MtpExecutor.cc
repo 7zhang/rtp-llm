@@ -806,6 +806,7 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
     // engine loop. Kineto callbacks are thread-affine; propagating an active
     // profiling state to async MTP worker threads can crash while perf timelines
     // are being recorded.
+    target_verify_prepare_runner_(cuda_graph::graphGetStreamFromPool(true), false),
     draft_prefill_prepare_runner_(cuda_graph::graphGetStreamFromPool(true), false),
     spec_logits_verify_async_runner_(cuda_graph::graphGetStreamFromPool(true), false),
     spec_logits_verify_runner_(std::make_unique<SpecLogitsVerifyRunner>()),
@@ -1531,8 +1532,13 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         return absl::OkStatus();
     }
 
+    launchTargetVerifyPrepareAsync(model_input, batch_size);
+
     if (propose_step_ > 1) {
         if (shouldSkipFakeStreamForStop(model_input, "draftModelDecode")) {
+            if (useAsyncPrepare()) {
+                target_verify_prepare_runner_.sync(cuda_graph::graphGetCurrentStream());
+            }
             releaseAllModelBuffers();
             return absl::OkStatus();
         }
@@ -1540,6 +1546,10 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         RTP_LLM_LOG_DEBUG("[MTP decode] draftModelDecode start");
         draftModelDecode(model_input, stream_groups, draft_probs_list, draft_token_ids_t, model_forward_us);
         RTP_LLM_LOG_DEBUG("[MTP decode] draftModelDecode end");
+    }
+    if (useAsyncPrepare()) {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(wait_target_verify_prepare)");
+        target_verify_prepare_runner_.sync(cuda_graph::graphGetCurrentStream());
     }
     auto draft_tokens_ready_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
     draft_tokens_ready_event->record(cuda_graph::graphGetCurrentStream());
@@ -1764,6 +1774,88 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                                 std::move(draft_prefill_sampler_output),
                                 std::move(rejection_event),
                                 std::move(draft_event));
+}
+
+void MtpExecutor::launchTargetVerifyPrepareAsync(const GptModelInputs& model_input, size_t batch_size) {
+    if (!useAsyncPrepare()) {
+        return;
+    }
+    if (isCpContextRequest(parallelism_config_, model_input)) {
+        RTP_LLM_LOG_DEBUG("[MTP decode] skip target-verify async prepare for CP context request");
+        return;
+    }
+    const auto& cache_cfg                    = cache_manager_->cacheConfig();
+    auto        model_input_copy             = model_input;
+    model_input_copy.kv_block_stride_bytes   = cache_cfg.kv_block_stride_bytes;
+    model_input_copy.kv_scale_stride_bytes   = cache_cfg.kv_scale_stride_bytes;
+    model_input_copy.kv_cache_layer_to_group = target_kv_cache_layer_to_group;
+    {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(prepare_target_verify_input)");
+        const auto cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+        model_input_copy.combo_tokens =
+            torch::empty({static_cast<int64_t>(batch_size * (propose_step_ + 1))}, cuda_i32);
+        torch::Tensor sequence_lengths_for_prepare = model_input.sequence_lengths;
+        if ((!sequence_lengths_for_prepare.defined()
+             || sequence_lengths_for_prepare.numel() < static_cast<int64_t>(batch_size))
+            && model_input.prefix_lengths.defined()) {
+            sequence_lengths_for_prepare = model_input.prefix_lengths;
+        }
+#if USING_CUDA
+        const bool can_fuse_target_prepare =
+            sequence_lengths_for_prepare.defined() && sequence_lengths_for_prepare.is_cuda()
+            && sequence_lengths_for_prepare.scalar_type() == torch::kInt32
+            && sequence_lengths_for_prepare.is_contiguous()
+            && sequence_lengths_for_prepare.numel() >= static_cast<int64_t>(batch_size);
+        if (can_fuse_target_prepare) {
+            model_input_copy.input_lengths           = torch::empty({static_cast<int64_t>(batch_size)}, cuda_i32);
+            model_input_copy.prefix_lengths          = torch::empty({static_cast<int64_t>(batch_size)}, cuda_i32);
+            model_input_copy.sequence_lengths_plus_1 = torch::empty({static_cast<int64_t>(batch_size)}, cuda_i32);
+            model_input_copy.lm_output_indexes       = torch::empty({static_cast<int64_t>(batch_size)}, cuda_i32);
+            RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(prepare_target_verify_input_fused)");
+            invokeMtpTargetVerifyPrepare(sequence_lengths_for_prepare,
+                                         model_input_copy.input_lengths,
+                                         model_input_copy.prefix_lengths,
+                                         model_input_copy.sequence_lengths_plus_1,
+                                         model_input_copy.lm_output_indexes,
+                                         static_cast<int32_t>(propose_step_ + 1),
+                                         cuda_graph::graphGetCurrentStream().stream());
+        } else
+#endif
+        {
+            RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(prepare_target_verify_input_fallback)");
+            model_input_copy.input_lengths =
+                torch::full({static_cast<int64_t>(batch_size)}, static_cast<int64_t>(propose_step_ + 1), cuda_i32);
+            model_input_copy.lm_output_indexes = torch::arange(0,
+                                                               static_cast<int64_t>(batch_size * (propose_step_ + 1)),
+                                                               static_cast<int64_t>(propose_step_ + 1),
+                                                               cuda_i32);
+            const auto& sequence_lengths =
+                sequence_lengths_for_prepare.defined() ? sequence_lengths_for_prepare : model_input.sequence_lengths;
+            model_input_copy.prefix_lengths          = toCudaInt32WithHostHold(sequence_lengths, buffer_holder_);
+            model_input_copy.sequence_lengths_plus_1 = model_input_copy.prefix_lengths + 1;
+        }
+    }
+    model_input_copy.last_hidden_states = torch::Tensor();
+    model_input_copy.sequence_lengths =
+        torch::empty({0}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+    model_input_copy.is_target_verify = true;
+    ensureModelInputsOnCuda(model_input_copy, "decode.target_prepare");
+
+    auto input_ready_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+    input_ready_event->record(cuda_graph::graphGetCurrentStream());
+    target_verify_prepare_runner_.launch(
+        [this, input_ready_event, model_input_copy = std::move(model_input_copy)]() mutable {
+            RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(target_verify_prepare_attention_inputs)");
+            {
+                RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(target_verify_prepare_wait_input)");
+                input_ready_event->block(cuda_graph::graphGetCurrentStream());
+            }
+            checkModelInputsOnCuda(model_input_copy, "decode.target_prepare.forwarded");
+            {
+                RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(target_verify_prepare_model_inputs)");
+                model_->prepareAttentionInputs(model_input_copy);
+            }
+        });
 }
 
 void MtpExecutor::launchDraftPrefillPrepareAsync(const GptModelInputs& model_input) {
@@ -2769,6 +2861,10 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
         }
 
         state.last_real_seq_len = stream->seqLength();
+        // This is an allocation upper bound for the next iteration's
+        // incrKVBlock while async bookkeeping is still in flight. It is not the
+        // committed sequence length; the exact accepted length is published via
+        // next_seq_len_gpu and then committed by the bookkeeping worker.
         state.next_real_seq_len = state.last_real_seq_len + static_cast<int>(propose_step_ + 1);
         // Publish per-stream GPU mirrors before launching bookkeeping.
         auto sp_output_buffer = stream->getSPOutputBuffer();
