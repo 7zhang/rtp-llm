@@ -24,6 +24,7 @@ _ENV_HOOK_FILE = "RTP_HOT_HOOK_FILE"
 _ENV_CONFIG = "RTP_HOT_HOOK_CONFIG"
 _ENV_DUMP_DIR = "RTP_HOT_HOOK_DUMP_DIR"
 _ENV_ALLOW_LOCAL_MUTATION = "RTP_HOT_HOOK_ALLOW_LOCAL_MUTATION"
+_SAFE_NAME_MAX_BYTES = 100
 
 
 def _truthy(value: Optional[str]) -> bool:
@@ -31,7 +32,17 @@ def _truthy(value: Optional[str]) -> bool:
 
 
 def _safe_name(name: str) -> str:
-    return "".join(c if c.isalnum() or c in ("-", "_", ".") else "_" for c in name)
+    safe = "".join(
+        c if c.isalnum() or c in ("-", "_", ".") else "_" for c in name
+    )
+    encoded = safe.encode("utf-8")
+    if len(encoded) <= _SAFE_NAME_MAX_BYTES:
+        return safe
+
+    digest = hashlib.sha256(name.encode("utf-8", errors="replace")).hexdigest()[:16]
+    prefix_bytes = _SAFE_NAME_MAX_BYTES - len(digest) - 1
+    prefix = encoded[:prefix_bytes].decode("utf-8", errors="ignore")
+    return f"{prefix}_{digest}"
 
 
 def _is_torch_tensor(value: Any) -> bool:
