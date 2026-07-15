@@ -8,7 +8,7 @@ or async generator so the whole proxy path stays on a single asyncio event loop.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Optional, Protocol, runtime_checkable
 
 import grpc
 
@@ -35,6 +35,16 @@ _FORWARD_CHANNEL_OPTS: list[tuple[str, int]] = [
     ("grpc.keepalive_permit_without_calls", 0),
     ("grpc.http2.max_pings_without_data", 0),
 ]
+
+
+@runtime_checkable
+class _CancelableStream(Protocol):
+    def cancel(self) -> bool: ...
+
+
+@runtime_checkable
+class _AsyncClosableStream(Protocol):
+    async def aclose(self) -> None: ...
 _CHANNEL_CLEANUP_INTERVAL_S = 60
 
 
@@ -373,26 +383,20 @@ class DashScProxyServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
         # Close any wrapping async generator first (e.g. counting wrapper).
         if downstream_iter is not upstream_iter:
             try:
-                aclose = getattr(downstream_iter, "aclose", None)
-                if aclose is not None:
-                    await aclose()
+                await downstream_iter.aclose()
             except Exception:
                 pass
-        # Cancel the underlying grpc.aio.Call. Sync, idempotent.
-        try:
-            cancel = getattr(upstream_iter, "cancel", None)
-            if cancel is not None:
-                cancel()
-        except Exception:
-            pass
-        # Tests / non-grpc fakes expose ``aclose`` on the upstream iterator
-        # (real grpc.aio calls don't); cover that path too.
-        try:
-            aclose = getattr(upstream_iter, "aclose", None)
-            if aclose is not None:
-                await aclose()
-        except Exception:
-            pass
+        # Production grpc.aio calls are cancelable. Local stream adapters can
+        # implement the explicit async-close contract instead.
+        if isinstance(upstream_iter, _CancelableStream):
+            upstream_iter.cancel()
+        elif isinstance(upstream_iter, _AsyncClosableStream):
+            await upstream_iter.aclose()
+        else:
+            logging.warning(
+                "[DashScGrpc] downstream stream has no supported close contract: %s",
+                type(upstream_iter).__name__,
+            )
 
     @staticmethod
     async def _buffered_iter(downstream_iter, access_record=None):

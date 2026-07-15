@@ -270,18 +270,14 @@ class DashScGrpcServer:
                     exc_info=True,
                 )
             if servicer is not None:
-                close = getattr(servicer, "close", None)
-                if close is not None:
-                    try:
-                        maybe = close()
-                        if asyncio.iscoroutine(maybe):
-                            await maybe
-                    except Exception as e:
-                        logging.warning(
-                            "[DashScGrpc] servicer.close failed: %s",
-                            e,
-                            exc_info=True,
-                        )
+                try:
+                    await servicer.close()
+                except Exception as e:
+                    logging.warning(
+                        "[DashScGrpc] servicer.close failed: %s",
+                        e,
+                        exc_info=True,
+                    )
 
         try:
             asyncio.run_coroutine_threadsafe(_do_stop(), loop).result()

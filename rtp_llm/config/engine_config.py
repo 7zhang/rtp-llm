@@ -176,10 +176,7 @@ class EngineConfig:
             lines.append(str(self.arpc_config))
 
         lines.append("\n[DashScGrpcConfig]")
-        if hasattr(self.dash_sc_grpc_config, "to_string"):
-            lines.append(self.dash_sc_grpc_config.to_string())
-        else:
-            lines.append(str(self.dash_sc_grpc_config))
+        lines.append(self.dash_sc_grpc_config.to_string())
 
         lines.append("\n[LoadConfig]")
         if hasattr(self.load_config, "to_string"):

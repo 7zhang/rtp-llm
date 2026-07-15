@@ -11,14 +11,10 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass, field
+from inspect import getattr_static as _read_static_member
 from pathlib import Path
 from types import FrameType, ModuleType
 from typing import Any, Callable, Dict, List, Optional, Tuple
-
-try:
-    import inspect
-except Exception:  # pragma: no cover
-    inspect = None
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -38,6 +34,14 @@ def _safe_name(name: str) -> str:
     return "".join(c if c.isalnum() or c in ("-", "_", ".") else "_" for c in name)
 
 
+def _is_torch_tensor(value: Any) -> bool:
+    try:
+        import torch
+    except Exception:
+        return False
+    return isinstance(value, torch.Tensor)
+
+
 def _json_default(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
@@ -45,23 +49,36 @@ def _json_default(value: Any) -> Any:
         return list(value)
     if isinstance(value, dict):
         return value
-    shape = getattr(value, "shape", None)
-    dtype = getattr(value, "dtype", None)
-    device = getattr(value, "device", None)
-    if shape is not None and dtype is not None:
+    if _is_torch_tensor(value):
         return {
             "type": type(value).__name__,
-            "shape": list(shape),
-            "dtype": str(dtype),
-            "device": str(device),
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "device": str(value.device),
         }
     return repr(value)
 
 
 def _copy_to_cpu(value: Any) -> Any:
-    if hasattr(value, "detach") and hasattr(value, "cpu"):
+    if _is_torch_tensor(value):
         return value.detach().cpu()
     return value
+
+
+def _read_member(owner: Any, name: str) -> Any:
+    """Read a hook target without invoking descriptors or fallback magic."""
+    return _read_static_member(owner, name)
+
+
+def _write_member(owner: Any, name: str, value: Any) -> None:
+    """Replace a member on a resolved hook target owner."""
+    if isinstance(owner, ModuleType):
+        vars(owner)[name] = value
+        return
+    if isinstance(owner, type):
+        type.__setattr__(owner, name, value)
+        return
+    vars(owner)[name] = value
 
 
 def _frame_locals_to_fast(frame: FrameType) -> None:
@@ -175,7 +192,7 @@ class HookContext:
 
     def hash(self, value: Any) -> str:
         value = _copy_to_cpu(value)
-        if hasattr(value, "numpy"):
+        if _is_torch_tensor(value):
             payload = value.numpy().tobytes()
         else:
             payload = repr(value).encode("utf-8", errors="replace")
@@ -187,7 +204,7 @@ class HookContext:
             stats = {"value": stats}
         try:
             tensor = _copy_to_cpu(value)
-            if hasattr(tensor, "float"):
+            if _is_torch_tensor(tensor):
                 as_float = tensor.float()
                 stats.update(
                     {
@@ -409,7 +426,8 @@ class HotHookRuntime:
         for hook_list in line_hooks.values():
             for hook in hook_list:
                 names.extend(hook.hook)
-        missing = [name for name in names if not callable(getattr(module, name, None))]
+        callbacks = vars(module)
+        missing = [name for name in names if not callable(callbacks.get(name))]
         if missing:
             raise RuntimeError(f"missing hot hook callback(s): {missing}")
 
@@ -427,7 +445,7 @@ class HotHookRuntime:
     def _callback(self, name: str) -> Callable[[HookContext], Any]:
         if self._hook_module is None:
             raise RuntimeError("hot hook module is not loaded")
-        callback = getattr(self._hook_module, name)
+        callback = vars(self._hook_module)[name]
         if not callable(callback):
             raise RuntimeError(f"hot hook callback is not callable: {name}")
         return callback
@@ -455,9 +473,7 @@ class HotHookRuntime:
 
     def _patch(self, target: str) -> None:
         parent, attr = self._resolve_parent(target)
-        original_descriptor = (
-            inspect.getattr_static(parent, attr) if inspect is not None else getattr(parent, attr)
-        )
+        original_descriptor = _read_member(parent, attr)
         descriptor_kind = "plain"
         if isinstance(original_descriptor, staticmethod):
             original_callable = original_descriptor.__func__
@@ -466,7 +482,7 @@ class HotHookRuntime:
             original_callable = original_descriptor.__func__
             descriptor_kind = "classmethod"
         else:
-            original_callable = getattr(parent, attr)
+            original_callable = original_descriptor
 
         @functools.wraps(original_callable)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -478,7 +494,7 @@ class HotHookRuntime:
             patched_value = classmethod(wrapper)
         else:
             patched_value = wrapper
-        setattr(parent, attr, patched_value)
+        _write_member(parent, attr, patched_value)
         self._patched[target] = _PatchedTarget(
             parent=parent,
             attr=attr,
@@ -491,7 +507,7 @@ class HotHookRuntime:
     def _unpatch(self, target: str) -> None:
         patched = self._patched.pop(target, None)
         if patched is not None:
-            setattr(patched.parent, patched.attr, patched.original_descriptor)
+            _write_member(patched.parent, patched.attr, patched.original_descriptor)
             _LOGGER.info("hot hook unpatched %s", target)
 
     def _unpatch_all(self) -> None:
@@ -509,7 +525,7 @@ class HotHookRuntime:
                 last_error = e
                 continue
             for part in parts[idx:-1]:
-                obj = getattr(obj, part)
+                obj = _read_member(obj, part)
             return obj, parts[-1]
         raise RuntimeError(f"cannot resolve hot hook target {target}: {last_error}")
 

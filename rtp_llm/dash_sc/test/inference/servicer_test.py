@@ -158,6 +158,9 @@ class _FakeTokenizer:
         self._mapping = mapping
         self.encode_calls: list[tuple[str, bool]] = []
 
+    def __len__(self) -> int:
+        return self.vocab_size
+
     def encode(self, text, add_special_tokens=True):
         self.encode_calls.append((text, add_special_tokens))
         return list(self._mapping[text])

@@ -197,13 +197,13 @@ def _derive_echo_prefix_ids(generate_env_config: Any, base_tok: Any) -> List[int
     stays aligned with the engine's thinking switch so dash_sc and the engine turn on/off
     together. Fail-open: any error returns ``[]`` and logs a warning.
     """
-    if not bool(getattr(generate_env_config, "think_mode", 0)):
+    if not bool(generate_env_config.think_mode):
         return []
-    tag = getattr(generate_env_config, "think_start_tag", "") or ""
+    tag = generate_env_config.think_start_tag
     if not tag:
         return []
     try:
-        hf_tok = getattr(base_tok, "tokenizer", base_tok)
+        hf_tok = base_tok.tokenizer
         ids = list(hf_tok.encode(tag, add_special_tokens=False))
     except Exception as e:
         logging.warning("[DashScApp] echo_prefix derive failed: %s", e)
@@ -213,7 +213,7 @@ def _derive_echo_prefix_ids(generate_env_config: Any, base_tok: Any) -> List[int
 
 
 def _tokenize_marker_text(base_tok: Any, text: str) -> List[int]:
-    tokenizer = getattr(base_tok, "tokenizer", base_tok)
+    tokenizer = base_tok.tokenizer
     try:
         token_ids = tokenizer.encode(text, add_special_tokens=False)
     except TypeError:
@@ -282,8 +282,7 @@ def _derive_stop_word_ids_list(
         params = RendererParams(
             model_type=model_config.model_type,
             max_seq_len=model_config.max_seq_len,
-            eos_token_id=getattr(base_tok, "eos_token_id", None)
-            or special_tokens.eos_token_id,
+            eos_token_id=base_tok.eos_token_id or special_tokens.eos_token_id,
             stop_word_ids_list=list(stop_words_id_list),
             template_type=model_config.template_type,
             ckpt_path=model_config.ckpt_path,
@@ -294,8 +293,8 @@ def _derive_stop_word_ids_list(
             gec,
             py_env_configs.render_config,
             model_config.ckpt_path,
-            getattr(py_env_configs, "misc_config", None),
-            getattr(py_env_configs, "vit_config", None),
+            py_env_configs.misc_config,
+            py_env_configs.vit_config,
         )
         stop_words_id_list.extend(
             [list(w) for w in (renderer.get_all_extra_stop_word_ids_list() or [])]
@@ -431,9 +430,8 @@ class DashScApp:
             self._shutdown_event.set()
 
         try:
-            pre_stop_signal = getattr(signal, "SIGUSR1", None)
-            if pre_stop_signal is not None:
-                signal.signal(pre_stop_signal, _drain_only_handler)
+            if os.name == "posix":
+                signal.signal(signal.SIGUSR1, _drain_only_handler)
             signal.signal(signal.SIGTERM, _handler)
             signal.signal(signal.SIGINT, _handler)
         except ValueError:
@@ -444,14 +442,11 @@ class DashScApp:
 
     def _close_servicer_on_loop(self, servicer: Any) -> None:
         loop = self._enqueue_loop
-        close = getattr(servicer, "close", None)
-        if loop is None or close is None:
+        if loop is None:
             return
 
         async def _do_close() -> None:
-            maybe = close()
-            if asyncio.iscoroutine(maybe):
-                await maybe
+            await servicer.close()
 
         try:
             asyncio.run_coroutine_threadsafe(_do_close(), loop).result(
@@ -509,7 +504,7 @@ class DashScApp:
                     self.py_env_configs.generate_env_config.think_terminate_token_id
                 )
                 think_runtime = build_think_runtime(
-                    base_tok,
+                    base_tok.tokenizer,
                     self.py_env_configs.generate_env_config,
                     model_config.model_type,
                     terminate_token_id=(
@@ -523,7 +518,7 @@ class DashScApp:
                     server_id=self.server_config.frontend_server_id,
                     echo_prefix_ids=echo_prefix_ids,
                     extra_stop_word_ids=extra_stop_word_ids,
-                    tokenizer=base_tok,
+                    tokenizer=base_tok.tokenizer,
                     generate_env_config=self.py_env_configs.generate_env_config,
                     think_runtime=think_runtime,
                     rank_id=self.server_config.rank_id,
@@ -703,7 +698,7 @@ class DashScApp:
 
     def _effective_pre_stop_drain_seconds(self) -> float:
         drain_seconds = _pre_stop_drain_seconds()
-        shutdown_timeout = getattr(self.server_config, "shutdown_timeout", None)
+        shutdown_timeout = self.server_config.shutdown_timeout
         if shutdown_timeout is None or shutdown_timeout <= 0:
             return drain_seconds
         headroom_seconds = _pre_stop_drain_headroom_seconds(float(shutdown_timeout))

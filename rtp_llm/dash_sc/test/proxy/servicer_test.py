@@ -8,6 +8,7 @@ propagation, and the per-addr channel cache.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterable
 import json
 import os
 import struct
@@ -92,6 +93,9 @@ class _AsyncIter:
         self._i += 1
         return x
 
+    def cancel(self) -> bool:
+        return False
+
 
 class _FakeChannel:
     def __init__(self, addr: str = ""):
@@ -125,7 +129,7 @@ def _install_mock_stub(servicer, mock_stub) -> None:
 
 
 def _stop_mock_stub(servicer) -> None:
-    patcher = getattr(servicer, "_test_stub_patcher", None)
+    patcher = servicer._test_stub_patcher
     if patcher is not None:
         patcher.stop()
         servicer._test_stub_patcher = None
@@ -305,7 +309,7 @@ class IteratorBehaviorTest(unittest.IsolatedAsyncioTestCase):
 
         call_arg = self.mock_stub.ModelStreamInfer.call_args[0][0]
         self.assertTrue(
-            hasattr(call_arg, "__aiter__"),
+            isinstance(call_arg, AsyncIterable),
             "Must be async iterable",
         )
         self.assertEqual(len(responses), 2)

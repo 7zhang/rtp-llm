@@ -100,11 +100,10 @@ class GracefulShutdownServer(Server):
         self._pre_stop_timer: Optional[threading.Timer] = None
 
     def install_pre_stop_drain_signal_handler(self) -> None:
-        pre_stop_signal = getattr(signal, "SIGUSR1", None)
-        if pre_stop_signal is None:
+        if os.name != "posix":
             return
         try:
-            signal.signal(pre_stop_signal, self.handle_pre_stop_drain_signal)
+            signal.signal(signal.SIGUSR1, self.handle_pre_stop_drain_signal)
         except ValueError:
             logging.warning(
                 "Frontend pre-stop drain signal handler not installed "

@@ -486,10 +486,7 @@ def main():
         tokenizer_path,
         args.model_type,
     )
-    input_ids = tokenizer.encode(args.prompt)
-    if hasattr(input_ids, "tolist"):
-        input_ids = input_ids.tolist()
-    input_ids = [int(x) for x in input_ids]
+    input_ids = [int(x) for x in tokenizer.encode(args.prompt)]
     print(f"[client] prompt: {args.prompt!r}")
     print(f"[client] input_ids ({len(input_ids)}): {input_ids}")
 

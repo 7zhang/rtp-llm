@@ -236,6 +236,7 @@ class TestProcessManager(unittest.TestCase):
                 self.name = name
                 self.pid = len(events) + 100
                 self._alive = True
+                self._popen = None
 
             def is_alive(self):
                 return self._alive
@@ -264,6 +265,7 @@ class TestProcessManager(unittest.TestCase):
                 self.name = name
                 self.pid = pid
                 self._alive = True
+                self._popen = None
 
             def is_alive(self):
                 return self._alive
@@ -905,6 +907,7 @@ class _FakeProc:
         self.pid = type(self)._next_pid
         self.name = name
         self._alive = alive
+        self._popen = None
         self._dies_on_terminate = dies_on_terminate
         self._dies_after = dies_after  # absolute time after which is_alive flips False
         self._exitcode = exitcode  # value reported once dead

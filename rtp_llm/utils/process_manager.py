@@ -196,7 +196,7 @@ class ProcessManager:
             return
         if signum == self._pre_stop_signal():
             try:
-                if getattr(proc, "pid", None) is not None:
+                if proc.pid is not None:
                     os.kill(proc.pid, signum)
             except (OSError, ProcessLookupError):
                 pass
@@ -205,7 +205,7 @@ class ProcessManager:
             # multiprocessing.Process has no portable send_signal() helper before
             # Python 3.14.  Only use os.kill for real started child processes;
             # tests often use lightweight fakes with synthetic pids.
-            if getattr(proc, "_popen", None) is not None:
+            if proc._popen is not None:
                 os.kill(proc.pid, signum)
             else:
                 proc.terminate()
@@ -521,7 +521,9 @@ class ProcessManager:
 
     @staticmethod
     def _pre_stop_signal() -> Optional[signal.Signals]:
-        return getattr(signal, "SIGUSR1", None)
+        if os.name != "posix":
+            return None
+        return signal.SIGUSR1
 
     def _send_pre_stop_drain_signal(self, processes: List[Process], group_name: str):
         pre_stop_signal = self._pre_stop_signal()
