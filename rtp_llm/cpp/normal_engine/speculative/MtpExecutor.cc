@@ -25,6 +25,7 @@
 #include "rtp_llm/models_py/bindings/cuda/kernels/mtp_target_verify_prepare.h"
 #endif
 #include "autil/TimeUtility.h"
+#include <algorithm>
 #include <limits>
 #include <cstdlib>
 #include <memory>
@@ -478,7 +479,286 @@ bool isCpContextRequest(const ParallelismConfig& parallelism_config, const GptMo
            && input.sequence_lengths.defined() && input.input_lengths.size(0) != input.sequence_lengths.size(0);
 }
 
+std::vector<int64_t>
+collectMtpLogprobRows(const StreamGroups& stream_groups, int64_t positions_per_batch, int64_t logits_rows) {
+    RTP_LLM_CHECK(positions_per_batch > 0);
+    std::vector<int64_t> requested_rows;
+    requested_rows.reserve(logits_rows);
+
+    int64_t row_offset     = 0;
+    bool    every_row_used = true;
+    for (const auto& stream : stream_groups.allStreams()) {
+        const int64_t row_count = static_cast<int64_t>(stream->nextBatchSize()) * positions_per_batch;
+        if (stream->generateConfig()->return_logprobs) {
+            for (int64_t row = 0; row < row_count; ++row) {
+                requested_rows.push_back(row_offset + row);
+            }
+        } else {
+            every_row_used = false;
+        }
+        row_offset += row_count;
+    }
+    RTP_LLM_CHECK_WITH_INFO(row_offset == logits_rows,
+                            "MTP logprob row layout mismatch: streams describe %ld rows, logits have %ld",
+                            row_offset,
+                            logits_rows);
+
+    // Undefined source_row_indices is the zero-copy identity mapping. This is
+    // important when every request asks for logprobs: do not duplicate the
+    // full raw logits merely to create a compact row set.
+    return every_row_used ? std::vector<int64_t>{} : requested_rows;
+}
+
+void validateMtpTargetLogprobRows(const MtpTargetLogprobs&    target_logprobs,
+                                  const std::vector<int64_t>& source_row_indices) {
+    RTP_LLM_CHECK(target_logprobs.raw_logits.defined());
+    const int64_t requested_row_count = static_cast<int64_t>(source_row_indices.size());
+    RTP_LLM_CHECK_WITH_INFO(requested_row_count <= target_logprobs.raw_logits.size(0),
+                            "requested MTP logprob rows %ld exceed captured logits rows %ld",
+                            requested_row_count,
+                            target_logprobs.raw_logits.size(0));
+    for (const int64_t row : source_row_indices) {
+        RTP_LLM_CHECK_WITH_INFO(row >= 0 && row < target_logprobs.raw_logits.size(0),
+                                "requested MTP logprob row %ld is outside [0, %ld)",
+                                row,
+                                target_logprobs.raw_logits.size(0));
+    }
+}
+
+torch::Tensor materializeMtpTargetLogprobRowIndices(MtpTargetLogprobs&          target_logprobs,
+                                                    const std::vector<int64_t>& source_row_indices) {
+    validateMtpTargetLogprobRows(target_logprobs, source_row_indices);
+    const int64_t requested_row_count = static_cast<int64_t>(source_row_indices.size());
+    if (target_logprobs.raw_logits.is_cuda()) {
+        target_logprobs.source_row_indices_cpu_owner = torch::empty(
+            {requested_row_count}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU).pinned_memory(true));
+        std::copy(source_row_indices.begin(),
+                  source_row_indices.end(),
+                  target_logprobs.source_row_indices_cpu_owner.data_ptr<int64_t>());
+        target_logprobs.source_row_indices = target_logprobs.source_row_indices_cpu_owner.to(
+            target_logprobs.raw_logits.device(), torch::kInt64, /*non_blocking=*/true, /*copy=*/true);
+    } else {
+        target_logprobs.source_row_indices =
+            torch::tensor(source_row_indices, torch::TensorOptions().dtype(torch::kInt64));
+    }
+    return target_logprobs.source_row_indices;
+}
+
+void selectMtpTargetLogprobRows(MtpTargetLogprobs& target_logprobs, const std::vector<int64_t>& source_row_indices) {
+    if (source_row_indices.empty()) {
+        return;
+    }
+    validateMtpTargetLogprobRows(target_logprobs, source_row_indices);
+    const int64_t requested_row_count = static_cast<int64_t>(source_row_indices.size());
+
+    bool identity = requested_row_count == target_logprobs.raw_logits.size(0);
+    for (int64_t i = 0; identity && i < requested_row_count; ++i) {
+        identity = source_row_indices[i] == i;
+    }
+    if (identity) {
+        return;
+    }
+
+    materializeMtpTargetLogprobRowIndices(target_logprobs, source_row_indices);
+    target_logprobs.raw_logits = target_logprobs.raw_logits.index_select(/*dim=*/0, target_logprobs.source_row_indices);
+}
+
+void computeMtpTargetLogprobRowStatistics(MtpTargetLogprobs& target_logprobs) {
+    RTP_LLM_CHECK(target_logprobs.raw_logits.defined());
+    RTP_LLM_CHECK(target_logprobs.raw_logits.dim() == 2);
+    RTP_LLM_CHECK_WITH_INFO(target_logprobs.raw_logits.size(0) > 0,
+                            "MTP target logprobs require at least one emitted row");
+    RTP_LLM_CHECK(!target_logprobs.row_logsumexp.defined());
+    RTP_LLM_CHECK(!target_logprobs.top_logits.defined());
+    RTP_LLM_CHECK(!target_logprobs.top_logprob_token_ids.defined());
+
+    target_logprobs.row_logsumexp =
+        torch::empty({target_logprobs.raw_logits.size(0)},
+                     target_logprobs.raw_logits.options().dtype(torch::kFloat32).requires_grad(false));
+#if USING_CUDA
+    if (target_logprobs.raw_logits.is_cuda()) {
+        invokeMtpRowLogSumExp(target_logprobs.raw_logits,
+                              target_logprobs.row_logsumexp,
+                              target_logprobs.raw_logits.size(1),
+                              cuda_graph::graphGetCurrentStream().stream());
+    } else
+#endif
+    {
+        target_logprobs.row_logsumexp = torch::logsumexp(target_logprobs.raw_logits.to(torch::kFloat32), -1);
+    }
+
+    const int64_t top_k = std::min<int64_t>(target_logprobs.requested_top_logprobs, target_logprobs.raw_logits.size(1));
+    if (top_k > 0) {
+        auto topk_result                      = target_logprobs.raw_logits.topk(top_k, -1, true, true);
+        target_logprobs.top_logits            = std::get<0>(topk_result);
+        target_logprobs.top_logprob_token_ids = std::get<1>(topk_result).to(torch::kInt32);
+    } else {
+        target_logprobs.top_logits =
+            torch::empty({target_logprobs.raw_logits.size(0), 0}, target_logprobs.raw_logits.options());
+        target_logprobs.top_logprob_token_ids = torch::empty({target_logprobs.raw_logits.size(0), 0},
+                                                             target_logprobs.raw_logits.options().dtype(torch::kInt32));
+    }
+}
+
 }  // namespace
+
+MtpTargetLogprobs
+captureMtpTargetLogprobs(const torch::Tensor& logits, int64_t max_top_logprobs, int64_t real_vocab_size) {
+    RTP_LLM_CHECK(logits.defined());
+    RTP_LLM_CHECK(logits.dim() == 2);
+    RTP_LLM_CHECK_WITH_INFO(real_vocab_size > 0 && real_vocab_size <= logits.size(1),
+                            "real vocab size %ld must be in [1, logits width %ld]",
+                            real_vocab_size,
+                            logits.size(1));
+
+    MtpTargetLogprobs result;
+    result.raw_logits             = logits.narrow(/*dim=*/1, /*start=*/0, real_vocab_size);
+    result.requested_top_logprobs = std::min<int64_t>(std::max<int64_t>(max_top_logprobs, 0), real_vocab_size);
+    return result;
+}
+
+MtpTargetLogprobs computeMtpTargetLogprobs(const torch::Tensor&        logits,
+                                           int64_t                     max_top_logprobs,
+                                           int64_t                     real_vocab_size,
+                                           const std::vector<int64_t>& source_row_indices) {
+    auto result = captureMtpTargetLogprobs(logits, max_top_logprobs, real_vocab_size);
+    selectMtpTargetLogprobRows(result, source_row_indices);
+    computeMtpTargetLogprobRowStatistics(result);
+    return result;
+}
+
+void finalizeMtpTargetLogprobs(MtpTargetLogprobs&   target_logprobs,
+                               const torch::Tensor& emitted_token_ids,
+                               const torch::Tensor& raw_logits_override) {
+    RTP_LLM_CHECK_WITH_INFO(target_logprobs.defined(), "cannot finalize undefined MTP target logprobs");
+    RTP_LLM_CHECK_WITH_INFO(!target_logprobs.finalized(), "MTP target logprobs were finalized more than once");
+    RTP_LLM_CHECK(target_logprobs.raw_logits.defined());
+    RTP_LLM_CHECK(target_logprobs.row_logsumexp.defined());
+    RTP_LLM_CHECK(target_logprobs.top_logits.defined());
+    RTP_LLM_CHECK(target_logprobs.top_logprob_token_ids.defined());
+    RTP_LLM_CHECK(emitted_token_ids.defined());
+
+    auto flattened_ids = emitted_token_ids.reshape({-1});
+    if (target_logprobs.source_row_indices.defined()) {
+        RTP_LLM_CHECK(target_logprobs.source_row_indices.device() == target_logprobs.raw_logits.device());
+        flattened_ids = flattened_ids.to(target_logprobs.raw_logits.device(), torch::kLong, false, false)
+                            .index_select(/*dim=*/0, target_logprobs.source_row_indices);
+    } else {
+        RTP_LLM_CHECK_WITH_INFO(flattened_ids.numel() == target_logprobs.raw_logits.size(0),
+                                "MTP emitted token rows %ld do not match target rows %ld",
+                                flattened_ids.numel(),
+                                target_logprobs.raw_logits.size(0));
+        flattened_ids = flattened_ids.to(target_logprobs.raw_logits.device(), torch::kLong, false, false);
+    }
+    RTP_LLM_CHECK(flattened_ids.numel() == target_logprobs.raw_logits.size(0));
+
+    const auto& raw_logits = raw_logits_override.defined() ? raw_logits_override : target_logprobs.raw_logits;
+    if (raw_logits_override.defined()) {
+        RTP_LLM_CHECK_WITH_INFO(raw_logits_override.dim() == 2,
+                                "MTP raw logits override must be 2-D, got dim=%ld",
+                                raw_logits_override.dim());
+        RTP_LLM_CHECK_WITH_INFO(raw_logits_override.sizes() == target_logprobs.raw_logits.sizes(),
+                                "MTP raw logits override shape must match captured rows");
+        RTP_LLM_CHECK_WITH_INFO(raw_logits_override.device() == target_logprobs.raw_logits.device(),
+                                "MTP raw logits override device must match captured rows");
+        RTP_LLM_CHECK_WITH_INFO(raw_logits_override.scalar_type() == target_logprobs.raw_logits.scalar_type(),
+                                "MTP raw logits override dtype must match captured rows");
+    }
+
+    // A failed sampler row or an unused speculative tail slot may contain -1
+    // or an otherwise uninitialized token ID. Gather must still remain device
+    // safe; downstream success/accept-length handling retains the original IDs
+    // and decides whether the row is emitted or reported as an error.
+    auto safe_flattened_ids        = flattened_ids.clamp(/*min=*/0, /*max=*/raw_logits.size(1) - 1);
+    auto selected_logits           = raw_logits.gather(/*dim=*/1, safe_flattened_ids.unsqueeze(1)).squeeze(1);
+    target_logprobs.token_logprobs = selected_logits.to(torch::kFloat32) - target_logprobs.row_logsumexp;
+    target_logprobs.top_logprobs =
+        target_logprobs.top_logits.to(torch::kFloat32) - target_logprobs.row_logsumexp.unsqueeze(1);
+
+    // Do not let async bookkeeping extend the lifetime of the full LM-head
+    // output. From this point onward the payload is O(requested_rows * K).
+    target_logprobs.raw_logits         = torch::Tensor();
+    target_logprobs.row_logsumexp      = torch::Tensor();
+    target_logprobs.top_logits         = torch::Tensor();
+    target_logprobs.source_row_indices = torch::Tensor();
+    RTP_LLM_CHECK(target_logprobs.finalized());
+}
+
+void finalizeSelectedMtpTargetLogprobs(MtpTargetLogprobs&          target_logprobs,
+                                       const torch::Tensor&        emitted_token_ids,
+                                       const std::vector<int64_t>& source_row_indices) {
+    RTP_LLM_CHECK_WITH_INFO(target_logprobs.defined(), "cannot finalize undefined MTP target logprobs");
+    RTP_LLM_CHECK_WITH_INFO(!target_logprobs.finalized(), "MTP target logprobs were finalized more than once");
+    RTP_LLM_CHECK(target_logprobs.raw_logits.defined());
+    RTP_LLM_CHECK(!target_logprobs.row_logsumexp.defined());
+    RTP_LLM_CHECK(!target_logprobs.top_logits.defined());
+    RTP_LLM_CHECK(!target_logprobs.top_logprob_token_ids.defined());
+    RTP_LLM_CHECK(emitted_token_ids.defined());
+    RTP_LLM_CHECK_WITH_INFO(!source_row_indices.empty(),
+                            "accepted MTP logprob finalization requires at least one selected row");
+
+#if USING_CUDA
+    if (target_logprobs.raw_logits.is_cuda()) {
+        auto row_indices = materializeMtpTargetLogprobRowIndices(target_logprobs, source_row_indices);
+        auto emitted_ids = emitted_token_ids.contiguous();
+        RTP_LLM_CHECK_WITH_INFO(emitted_ids.is_cuda(), "CUDA MTP target logits require CUDA emitted token IDs");
+        RTP_LLM_CHECK_WITH_INFO(emitted_ids.device() == target_logprobs.raw_logits.device(),
+                                "MTP target logits and emitted token IDs must share a CUDA device");
+
+        const int64_t selected_rows    = row_indices.numel();
+        const int64_t top_k            = target_logprobs.requested_top_logprobs;
+        auto          fp32_options     = target_logprobs.raw_logits.options().dtype(torch::kFloat32);
+        target_logprobs.token_logprobs = torch::empty({selected_rows}, fp32_options);
+        target_logprobs.top_logprob_token_ids =
+            torch::empty({selected_rows, top_k}, target_logprobs.raw_logits.options().dtype(torch::kInt32));
+        target_logprobs.top_logprobs = torch::empty({selected_rows, top_k}, fp32_options);
+
+        // These tensors were produced on the main compute stream and are read
+        // by the bookkeeping stream. Record that use before dropping the raw
+        // owner so the caching allocator cannot recycle either input early.
+        recordSpecTensorUseOnCurrentStream(target_logprobs.raw_logits);
+        recordSpecTensorUseOnCurrentStream(emitted_ids);
+        invokeMtpSelectedRowLogProbs(target_logprobs.raw_logits,
+                                     row_indices,
+                                     emitted_ids,
+                                     target_logprobs.token_logprobs,
+                                     target_logprobs.top_logprob_token_ids,
+                                     target_logprobs.top_logprobs,
+                                     top_k,
+                                     cuda_graph::graphGetCurrentStream().stream());
+
+        // The fused kernel reads selected source rows directly. No [R,V]
+        // index_select or full-vocabulary probability tensor is materialized.
+        target_logprobs.raw_logits         = torch::Tensor();
+        target_logprobs.source_row_indices = torch::Tensor();
+        RTP_LLM_CHECK(target_logprobs.finalized());
+        return;
+    }
+#endif
+
+    // CPU-only tests/non-CUDA builds use the simple reference implementation;
+    // production CUDA decode takes the indexed fused path above.
+    selectMtpTargetLogprobRows(target_logprobs, source_row_indices);
+    computeMtpTargetLogprobRowStatistics(target_logprobs);
+    finalizeMtpTargetLogprobs(target_logprobs, emitted_token_ids);
+}
+
+torch::Tensor reshapeMtpTargetAllProbs(const torch::Tensor& all_probs,
+                                       int64_t              batch_size,
+                                       int64_t              positions_per_batch,
+                                       int64_t              logits_width) {
+    RTP_LLM_CHECK(all_probs.defined());
+    RTP_LLM_CHECK(batch_size > 0);
+    RTP_LLM_CHECK(positions_per_batch > 0);
+    RTP_LLM_CHECK(logits_width > 0);
+    RTP_LLM_CHECK_WITH_INFO(all_probs.numel() == batch_size * positions_per_batch * logits_width,
+                            "MTP target all_probs layout mismatch: numel=%ld, batch=%ld, positions=%ld, width=%ld",
+                            all_probs.numel(),
+                            batch_size,
+                            positions_per_batch,
+                            logits_width);
+    return all_probs.reshape({batch_size, positions_per_batch, logits_width});
+}
 
 void MtpExecutor::notifyStop() {
     stop_requested_.store(true, std::memory_order_release);
@@ -1089,13 +1369,14 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
     RtpLLMExecutorMetricsCollector& executor_collector = metrics_collector.executor_collector;
     RtpLLMTokenPSMetricsCollector&  tps_collector      = metrics_collector.tps_collector;
 
-    StreamGroups    stream_groups(streams);
-    GptModelInputs  model_input;
-    GptModelOutputs model_output;
-    SamplerOutput   sampler_output;
-    GptModelOutputs draft_model_output;
-    SamplerOutput   draft_sampler_output;
-    torch::Tensor   draft_last_hidden_states;
+    StreamGroups      stream_groups(streams);
+    GptModelInputs    model_input;
+    GptModelOutputs   model_output;
+    SamplerOutput     sampler_output;
+    GptModelOutputs   draft_model_output;
+    SamplerOutput     draft_sampler_output;
+    torch::Tensor     draft_last_hidden_states;
+    MtpTargetLogprobs target_logprobs;
 
     // placeholder for some tensors
     torch::Tensor                      draft_probs;
@@ -1184,10 +1465,27 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
             }
             model_input.last_hidden_states = model_output.all_hidden_states;
         } else {
+            if (stream_groups.needReturnLogProbs()) {
+                target_logprobs = computeMtpTargetLogprobs(
+                    model_output.logits,
+                    stream_groups.maxTopLogProbs(),
+                    static_cast<int64_t>(vocab_size_),
+                    collectMtpLogprobRows(stream_groups, /*positions_per_batch=*/1, model_output.logits.size(0)));
+            }
             CHECK_AND_RETURN_REF(sampler_input,
                                  batch_stream_processor_->gatherSamplerInput(stream_groups, model_input, model_output));
             holdSamplerInputHostBuffers(buffer_holder_, sampler_input);
             sampler_output = std::move(sampler_->forward(sampler_input));
+            if (target_logprobs.defined()) {
+                RTP_LLM_CHECK(sampler_output.token_ids.defined() && sampler_output.token_ids.dim() == 2);
+                RTP_LLM_CHECK_WITH_INFO(
+                    sampler_output.raw_logprobs_logits.defined(),
+                    "MTP prefill logprobs require the sampler's pre-processing raw logits snapshot");
+                finalizeMtpTargetLogprobs(
+                    target_logprobs,
+                    sampler_output.token_ids.select(/*dim=*/1, sampler_output.token_ids.size(1) - 1),
+                    sampler_output.raw_logprobs_logits);
+            }
             // Restore the full combo_tokens / input_lengths before the MTP
             // shift logic — under CP both were mutated to rank-local by the
             // target forward's handleInputs and the shift formula assumes a
@@ -1288,7 +1586,8 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
             batch_stream_processor_->dispatchPrefill(stream_groups,
                                                      {std::move(model_output), std::move(sampler_output)},
                                                      {std::move(draft_model_output), std::move(draft_sampler_output)},
-                                                     draft_last_hidden_states);
+                                                     draft_last_hidden_states,
+                                                     target_logprobs);
         RTP_LLM_LOG_DEBUG("dispatch done");
         return result;
     }
@@ -1464,6 +1763,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     SamplerOutput                         draft_sampler_output;
     speculative::SpeculativeSamplerOutput speculative_sampler_output;
+    MtpTargetLogprobs                     target_logprobs;
 
     // Placeholders shared across draftModelDecode and the post-rejection update.
     torch::Tensor              draft_token_probs_d_t;
@@ -1579,6 +1879,14 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         model_forward_us += autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
     }
 
+    if (isTpRank0() && !model_input.is_fake_stream && stream_groups.needReturnLogProbs()) {
+        // Capture only a real-vocabulary view before sampler-side mutation.
+        // Row selection and every full-vocabulary reduction are deferred until
+        // bookkeeping knows the final accepted rows.
+        target_logprobs = captureMtpTargetLogprobs(
+            model_output.logits, stream_groups.maxTopLogProbs(), static_cast<int64_t>(vocab_size_));
+    }
+
     // trick: update draft sampler output after spec decode to avoid kernel launch overhead
     if (isTpRank0()) {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(update_draft_sampler_output)");
@@ -1692,8 +2000,10 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
                                      stream_groups, model_input, model_output, *spec_logits_result));
             holdSamplerInputHostBuffers(buffer_holder_, sampler_input);
             sampler_output           = std::move(sampler_->forward(sampler_input));
-            sampler_output.all_probs = sampler_output.all_probs.reshape(
-                {(int64_t)batch_size, (int64_t)(propose_step_ + 1), (int64_t)vocab_size_});
+            sampler_output.all_probs = reshapeMtpTargetAllProbs(sampler_output.all_probs,
+                                                                static_cast<int64_t>(batch_size),
+                                                                static_cast<int64_t>(propose_step_ + 1),
+                                                                sampler_input.logits.size(1));
 
             // rejection sampling
             speculative_sampler_output = speculative_sampler_->forward(streams, draft_sampler_output, sampler_output);
@@ -1771,6 +2081,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     return dispatchDecodeOutput(stream_groups,
                                 streams,
                                 speculative_sampler_output,
+                                std::move(target_logprobs),
                                 std::move(draft_prefill_model_output),
                                 std::move(draft_prefill_sampler_output),
                                 std::move(rejection_event),
@@ -2304,6 +2615,7 @@ void MtpExecutor::collectDecodeMetrics(const StreamGroups&                      
 absl::Status MtpExecutor::dispatchDecodeOutput(const StreamGroups&                          stream_groups,
                                                const std::list<GenerateStreamPtr>&          streams,
                                                const speculative::SpeculativeSamplerOutput& speculative_sampler_output,
+                                               MtpTargetLogprobs                            target_logprobs,
                                                GptModelOutputs                              draft_prefill_model_output,
                                                SamplerOutput                 draft_prefill_sampler_output,
                                                std::shared_ptr<torch::Event> rejection_event,
@@ -2315,14 +2627,15 @@ absl::Status MtpExecutor::dispatchDecodeOutput(const StreamGroups&              
         // via cudaStreamWaitEvent; the main thread returns immediately.
         result = dispatchDecodeAsync(stream_groups,
                                      speculative_sampler_output,
+                                     std::move(target_logprobs),
                                      {std::move(draft_prefill_model_output), std::move(draft_prefill_sampler_output)},
                                      std::move(rejection_event),
                                      std::move(draft_event));
     } else {
         MergedOutput draft_prefill_output{std::move(draft_prefill_model_output),
                                           std::move(draft_prefill_sampler_output)};
-        result =
-            batch_stream_processor_->dispatchDecode(stream_groups, speculative_sampler_output, draft_prefill_output);
+        result = batch_stream_processor_->dispatchDecode(
+            stream_groups, speculative_sampler_output, draft_prefill_output, std::move(target_logprobs));
         if (result.ok()) {
             publishSyncMtpDeviceState(stream_groups, speculative_sampler_output, draft_prefill_output);
         }
@@ -2342,6 +2655,16 @@ void MtpExecutor::releaseAllModelBuffers() {
     if (sp_prefill_draft_model_) {
         sp_prefill_draft_model_->releaseBuffers();
     }
+}
+
+void MtpExecutor::syncPendingAsyncLogprobBookkeeping() {
+    if (!pending_async_logprob_bookkeeping_) {
+        return;
+    }
+    RTP_LLM_CHECK(useStreamAsync());
+    RTP_LLM_PROFILE_SCOPE("executor.mtp.wait_pending_async_logprob_bookkeeping");
+    spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
+    pending_async_logprob_bookkeeping_ = false;
 }
 
 void MtpExecutor::prepareStreams(const std::list<GenerateStreamPtr>& streams,
@@ -2396,6 +2719,12 @@ absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams, i
         tps_reporter_.makeActiveGuard(metrics_reporter_ && isTpRank0() && !warm_up_ && !streams.empty());
     auto wall_tps_active_guard =
         wall_tps_reporter_.makeActiveGuard(metrics_reporter_ && isTpRank0() && !warm_up_ && !streams.empty());
+
+    // The previous async logprob payload may outlive the stream that requested
+    // it. Release its full target LM-head output before prepareStreams and any
+    // PDFUSION prefill/draft/target forward can allocate the next step's model
+    // tensors. With no logprob payload this is a single false branch.
+    syncPendingAsyncLogprobBookkeeping();
 
     std::list<GenerateStreamPtr> prefill_streams;
     std::list<GenerateStreamPtr> decode_streams;
@@ -2812,10 +3141,13 @@ void MtpExecutor::publishSyncMtpDeviceState(const StreamGroups&                 
 
 absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&                          stream_groups,
                                               const speculative::SpeculativeSamplerOutput& spec_decode_output,
+                                              MtpTargetLogprobs                            target_logprobs,
                                               MergedOutput                                 draft_prefill_output,
                                               std::shared_ptr<torch::Event>                rejection_event,
                                               std::shared_ptr<torch::Event>                draft_event) {
     RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(dispatch_output_async)");
+
+    const bool payload_holds_target_logits = target_logprobs.raw_logits.defined();
 
     const auto& accept_len_gpu_all     = spec_decode_output.accept_len;
     const auto& accept_tokens_gpu_all  = spec_decode_output.accept_tokens;
@@ -2918,10 +3250,11 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
     }
 
     // --- Launch async worker (unchanged) ---
-    auto* processor          = batch_stream_processor_.get();
-    auto  spec_decode_copy   = spec_decode_output;
-    auto  draft_prefill_copy = std::move(draft_prefill_output);
-    auto  stream_groups_copy = stream_groups;
+    auto* processor            = batch_stream_processor_.get();
+    auto  spec_decode_copy     = spec_decode_output;
+    auto  target_logprobs_copy = std::move(target_logprobs);
+    auto  draft_prefill_copy   = std::move(draft_prefill_output);
+    auto  stream_groups_copy   = stream_groups;
 
     auto streams_for_inc = stream_groups_copy.allStreams();
     for (auto& s : streams_for_inc) {
@@ -2929,9 +3262,10 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
     }
 
     spec_bookkeeping_runner_.launch([processor,
-                                     stream_groups_copy = std::move(stream_groups_copy),
-                                     spec_decode_copy   = std::move(spec_decode_copy),
-                                     draft_prefill_copy = std::move(draft_prefill_copy),
+                                     stream_groups_copy   = std::move(stream_groups_copy),
+                                     spec_decode_copy     = std::move(spec_decode_copy),
+                                     target_logprobs_copy = std::move(target_logprobs_copy),
+                                     draft_prefill_copy   = std::move(draft_prefill_copy),
                                      rejection_event,
                                      draft_event]() mutable {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(spec_bookkeeping_worker)");
@@ -2951,7 +3285,10 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
             draft_event->block(cuda_graph::graphGetCurrentStream());
         }
 
-        auto status = processor->dispatchDecode(stream_groups_copy, spec_decode_copy, draft_prefill_copy);
+        // Move into dispatch so the worker closure itself does not retain the
+        // full target tensor after selected-row statistics have been produced.
+        auto status = processor->dispatchDecode(
+            stream_groups_copy, spec_decode_copy, draft_prefill_copy, std::move(target_logprobs_copy));
         if (!status.ok()) {
             RTP_LLM_LOG_ERROR("[stream-async] dispatchDecode (worker) failed: %s", status.ToString().c_str());
         }
@@ -2965,6 +3302,10 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
             stream->setPendingSwapDoneEvent(std::static_pointer_cast<void>(event));
         }
     });
+
+    // Launch succeeded. The next target forward must release this exact
+    // previous payload first; the requesting stream may no longer be scheduled.
+    pending_async_logprob_bookkeeping_ = payload_holds_target_logits;
 
     return absl::OkStatus();
 }

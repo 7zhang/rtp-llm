@@ -18,6 +18,7 @@ class GenerateStreamBuilder {
 public:
     GenerateStreamBuilder() {
         model_config_.max_seq_len = 2048;
+        model_config_.vocab_size  = 128;
     }
 
     CacheConfig init_config() {
@@ -95,6 +96,29 @@ TEST_F(GenerateStreamTest, testConstruct) {
     auto builder = GenerateStreamBuilder();
     auto stream1 = builder.createContextStream({{1, 2, 3, 4, 5}, {}});
     auto stream2 = builder.createDecoderStream({1, 2, 3, 4, 5}, {1, 2, 3});
+}
+
+TEST_F(GenerateStreamTest, testLogprobsHistoryUsesBoundedGeometricGrowth) {
+    auto generate_config             = std::make_shared<GenerateConfig>();
+    generate_config->return_logprobs = true;
+    generate_config->top_logprobs    = 20;
+    generate_config->max_new_tokens  = 2000;
+    auto stream                      = GenerateStreamBuilder().createContextStream({1}, generate_config);
+
+    ASSERT_EQ(stream->getTokenLogProbs().sizes(), (torch::IntArrayRef{1, 64}));
+    ASSERT_EQ(stream->getTopLogprobTokenIds().sizes(), (torch::IntArrayRef{1, 64, 20}));
+    ASSERT_EQ(stream->getTopLogProbs().sizes(), (torch::IntArrayRef{1, 64, 20}));
+    EXPECT_LT(stream->getTokenLogProbs().size(1), generate_config->max_new_tokens);
+
+    auto selected = torch::arange(65, torch::kFloat32).reshape({1, 65});
+    auto top_ids  = torch::arange(65 * 20, torch::kInt32).reshape({1, 65, 20});
+    auto top      = torch::arange(65 * 20, torch::kFloat32).reshape({1, 65, 20});
+    stream->setLogProbs(selected, top_ids, top, torch::Tensor(), stream->inputLength());
+
+    ASSERT_EQ(stream->getTokenLogProbs().size(1), 128);
+    EXPECT_TRUE(torch::equal(stream->getTokenLogProbs().narrow(1, 0, 65), selected));
+    EXPECT_TRUE(torch::equal(stream->getTopLogprobTokenIds().narrow(1, 0, 65), top_ids));
+    EXPECT_TRUE(torch::equal(stream->getTopLogProbs().narrow(1, 0, 65), top));
 }
 
 TEST_F(GenerateStreamTest, testGenerateStreamReuseCacheMethod) {

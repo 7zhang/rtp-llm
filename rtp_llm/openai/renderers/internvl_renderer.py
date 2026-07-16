@@ -176,6 +176,13 @@ class InternVLRenderer(CustomChatRenderer):
             functools.partial(self._check_finish_reason, max_new_tokens=max_new_tokens),
             self._remove_stop_word_ids,
         )
+        self._accumulate_log_probs_from_tensors(
+            status,
+            output.output_ids,
+            output.token_logprobs,
+            output.top_logprob_token_ids,
+            output.top_logprobs,
+        )
         decoded_prev_token = self.tokenizer.decode(status.prev_token_id)
         decoded_string = self.tokenizer.decode(status.tokens_to_decode)
         # For some tokenizers (e.g. ChatGLM), decode a single token differs from decode a list of tokens.
@@ -202,23 +209,29 @@ class InternVLRenderer(CustomChatRenderer):
             status.delta_output_string = decoded_string[len(decoded_prev_token) :]
 
         # Process stop words: truncate complete stop words, detect partial stop words
+        untruncated_delta = status.delta_output_string
         status.delta_output_string, should_buffer = self._process_stop_words(
-            status.delta_output_string,
+            untruncated_delta,
             stop_words_str,
             stop_word_slice_list,
             is_streaming,
             status,
         )
+        if len(status.delta_output_string) < len(untruncated_delta):
+            self._trim_pending_logprobs_to_visible_text(
+                status, status.delta_output_string
+            )
 
         if should_buffer:
             return await self._create_empty_delta(output.aux_info)
 
         # Build delta output
         if len(status.delta_output_string) > 0:
+            current_logprobs = self._take_pending_logprobs(status)
             status.update_result()
             delta = OutputDelta(
                 output_str=status.delta_output_string,
-                logprobs=await self._generate_log_probs(status, output),
+                logprobs=current_logprobs,
                 input_length=output.aux_info.input_len,
                 output_length=output.aux_info.output_len,
                 reuse_length=output.aux_info.reuse_len,
@@ -226,7 +239,10 @@ class InternVLRenderer(CustomChatRenderer):
             status.delta_output_string = ""
             return delta
         else:
-            return await self._create_empty_delta(output.aux_info)
+            current_logprobs = self._take_pending_logprobs(status)
+            if current_logprobs:
+                status.update_result()
+            return await self._create_empty_delta(output.aux_info, current_logprobs)
 
     def render_chat(self, request: ChatCompletionRequest) -> RenderedInputs:
         messages = copy.deepcopy(request.messages)

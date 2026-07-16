@@ -16,6 +16,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
+import torch
+
 from rtp_llm.dash_sc.proto import predict_v2_pb2
 from rtp_llm.dash_sc.structural_tag import (
     DashScStructuralTagError,
@@ -192,6 +194,115 @@ def _parse_optional_bool(value: Any) -> bool | None:
     if s in {"0", "false", "no", "n", "off", "disable", "disabled"}:
         return False
     return None
+
+
+def _parse_strict_bool_control(
+    request,
+    ds_attrs: dict[str, Any],
+    *names: str,
+) -> tuple[bool | None, bool]:
+    """Read an optional boolean request control without silently coercing errors.
+
+    The DashScope bridge has shipped the same OpenAI-compatible controls as input
+    tensors, Triton parameters, and nested ``ds_header_attributes`` values.  The
+    second return value records explicit presence so callers can distinguish an
+    omitted value from an invalid/false value.
+    """
+    for name in names:
+        inp, raw = _find_input_raw(request, name)
+        if inp is not None:
+            if raw is None:
+                raise DashScParameterError(f"invalid {name}: missing tensor payload")
+            if list(inp.shape) != [1]:
+                raise DashScParameterError(
+                    f"invalid {name}: must have scalar shape [1]"
+                )
+            if inp.datatype == "BOOL" and len(raw) == 1 and raw[0] in (0, 1):
+                return raw[0] == 1, True
+            if inp.datatype == "INT32" and len(raw) == 4:
+                value = struct.unpack("<i", raw)[0]
+                if value in (0, 1):
+                    return bool(value), True
+            if inp.datatype == "INT64" and len(raw) == 8:
+                value = struct.unpack("<q", raw)[0]
+                if value in (0, 1):
+                    return bool(value), True
+            raise DashScParameterError(f"invalid {name}: must be a boolean scalar")
+
+        if name in request.parameters:
+            param = request.parameters[name]
+            if param.HasField("bool_param"):
+                return bool(param.bool_param), True
+            if param.HasField("int64_param"):
+                value = int(param.int64_param)
+                if value in (0, 1):
+                    return bool(value), True
+            elif param.HasField("string_param"):
+                value = _parse_optional_bool(param.string_param)
+                if value is not None:
+                    return value, True
+            raise DashScParameterError(f"invalid {name}: must be a boolean")
+
+        raw_value = _lookup_ds_request_control(ds_attrs, name)
+        if raw_value is not None:
+            if isinstance(raw_value, bool):
+                value = raw_value
+            elif isinstance(raw_value, int) and raw_value in (0, 1):
+                value = bool(raw_value)
+            elif isinstance(raw_value, str):
+                value = _parse_optional_bool(raw_value)
+            else:
+                value = None
+            if value is None:
+                raise DashScParameterError(f"invalid {name}: must be a boolean")
+            return value, True
+    return None, False
+
+
+def _parse_strict_int_control(
+    request,
+    ds_attrs: dict[str, Any],
+    *names: str,
+) -> tuple[int | None, bool]:
+    """Read an optional integer request control, rejecting bool/float values."""
+    for name in names:
+        inp, raw = _find_input_raw(request, name)
+        if inp is not None:
+            if raw is None:
+                raise DashScParameterError(f"invalid {name}: missing tensor payload")
+            if list(inp.shape) != [1]:
+                raise DashScParameterError(
+                    f"invalid {name}: must have scalar shape [1]"
+                )
+            if inp.datatype == "INT32" and len(raw) == 4:
+                return int(struct.unpack("<i", raw)[0]), True
+            if inp.datatype == "INT64" and len(raw) == 8:
+                return int(struct.unpack("<q", raw)[0]), True
+            raise DashScParameterError(f"invalid {name}: must be an integer scalar")
+
+        if name in request.parameters:
+            param = request.parameters[name]
+            if param.HasField("int64_param"):
+                return int(param.int64_param), True
+            if param.HasField("string_param"):
+                value = str(param.string_param).strip()
+                try:
+                    return int(value), True
+                except (TypeError, ValueError):
+                    pass
+            raise DashScParameterError(f"invalid {name}: must be an integer")
+
+        raw_value = _lookup_ds_request_control(ds_attrs, name)
+        if raw_value is not None:
+            if isinstance(raw_value, bool) or not isinstance(raw_value, int):
+                if isinstance(raw_value, str):
+                    try:
+                        return int(raw_value.strip()), True
+                    except (TypeError, ValueError):
+                        pass
+                raise DashScParameterError(f"invalid {name}: must be an integer")
+            return int(raw_value), True
+    return None, False
 
 
 def parse_ds_header_attributes(request) -> dict[str, Any]:
@@ -584,6 +695,8 @@ class SamplingParams:
     repetition_penalty: float = 1.0
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
+    return_logprobs: bool = False
+    top_logprobs: int = 0
     stop_words_list: tuple[tuple[int, ...], ...] = field(default_factory=tuple)
     max_new_think_tokens: int | None = None
     response_format: str | None = None
@@ -633,6 +746,8 @@ class SamplingParams:
             repetition_penalty=self.repetition_penalty,
             frequency_penalty=self.frequency_penalty,
             presence_penalty=self.presence_penalty,
+            return_logprobs=self.return_logprobs,
+            top_logprobs=self.top_logprobs,
             stop_words_list=self.stop_words_list_py(),
             max_thinking_tokens=max_thinking_tokens,
             return_input_ids=return_input_ids,
@@ -669,6 +784,7 @@ def parse_sampling_params(
     ``top_p``, ``top_k``, ``stop_words_list``, ``temperature``,
     ``min_new_tokens`` (or DashScope alias ``min_length``), ``seed``,
     ``repetition_penalty``, ``frequency_penalty``, ``presence_penalty``,
+    ``logprobs`` / ``return_logprobs``, ``top_logprobs``,
     ``max_new_think_tokens`` / ``max_think_length``.
 
     Legacy: if there is no ``top_k`` input, ``request.parameters["top_k"].int64_param``
@@ -683,6 +799,8 @@ def parse_sampling_params(
     repetition_penalty = 1.0
     frequency_penalty = 0.0
     presence_penalty = 0.0
+    return_logprobs = False
+    top_logprobs = 0
     max_new_think_tokens: int | None = None
     stop_words_list: tuple[tuple[int, ...], ...] = tuple()
     ds_attrs = ds_attrs if ds_attrs is not None else parse_ds_header_attributes(request)
@@ -695,6 +813,16 @@ def parse_sampling_params(
     v = _parse_optional_scalar_int(request, "num_return_sequences")
     if v is None:
         v = _parse_optional_scalar_int(request, "n")
+    if v is None:
+        v = _parse_optional_parameter_int(request, "num_return_sequences")
+    if v is None:
+        v = _parse_optional_parameter_int(request, "n")
+    if v is None:
+        v = _parse_optional_int_value(
+            _lookup_ds_request_control(ds_attrs, "num_return_sequences")
+        )
+    if v is None:
+        v = _parse_optional_int_value(_lookup_ds_request_control(ds_attrs, "n"))
     if v is not None:
         num_return_sequences = max(0, v)
 
@@ -736,6 +864,24 @@ def parse_sampling_params(
     if vf is not None:
         presence_penalty = vf
 
+    parsed_logprobs, logprobs_was_set = _parse_strict_bool_control(
+        request, ds_attrs, "logprobs", "return_logprobs"
+    )
+    if logprobs_was_set:
+        return_logprobs = bool(parsed_logprobs)
+    parsed_top_logprobs, top_logprobs_was_set = _parse_strict_int_control(
+        request, ds_attrs, "top_logprobs"
+    )
+    if top_logprobs_was_set:
+        assert parsed_top_logprobs is not None
+        top_logprobs = parsed_top_logprobs
+        if not 0 <= top_logprobs <= 20:
+            raise DashScParameterError("top_logprobs must be between 0 and 20")
+        if not return_logprobs:
+            raise DashScParameterError("top_logprobs requires logprobs=true")
+    if return_logprobs and num_return_sequences > 1:
+        raise DashScParameterError("logprobs does not support n > 1")
+
     for tensor_name in ("max_think_length", "max_new_think_tokens"):
         v = _parse_optional_scalar_int(request, tensor_name)
         if v is not None:
@@ -763,6 +909,8 @@ def parse_sampling_params(
         repetition_penalty=repetition_penalty,
         frequency_penalty=frequency_penalty,
         presence_penalty=presence_penalty,
+        return_logprobs=return_logprobs,
+        top_logprobs=top_logprobs,
         max_new_think_tokens=max_new_think_tokens,
         stop_words_list=stop_words_list,
         response_format=response_format,
@@ -940,12 +1088,17 @@ def prepend_to_generated_ids_tensor(
     """Prepend ``token_ids`` to the already-appended ``generated_ids`` tensor on ``infer``.
 
     Returns ``False`` and leaves ``infer`` untouched when ``token_ids`` is empty, when
-    ``generated_ids`` is absent, or when its declared shape is a zero-length / filler
-    payload (``shape[-1] <= 0``). On success, re-packs the raw bytes as
-    ``token_ids + existing_ids`` (INT32 little-endian) and updates ``shape`` to
-    ``[1, len(token_ids) + cur_len]``.
+    ``generated_ids`` is absent, when its declared shape is a zero-length / filler
+    payload, or when the frame already contains logprob tensors. Prompt echo tokens
+    have no sampled probability; callers must emit them in a separate no-logprob
+    frame instead of making the existing tensors misaligned.
     """
     if not token_ids:
+        return False
+    if any(
+        out.name in {"token_logprobs", "top_logprob_token_ids", "top_logprobs"}
+        for out in infer.outputs
+    ):
         return False
     for i, out in enumerate(infer.outputs):
         if out.name != "generated_ids":
@@ -1061,6 +1214,171 @@ def _append_aux_info_metrics_outputs(
     _append_prompt_cache_usage_parameters(infer, input_len, reuse_len)
 
 
+def _normalize_token_logprobs_tensor(
+    tensor: Any,
+    *,
+    tensor_name: str,
+    num_tokens: int,
+) -> torch.Tensor:
+    value = tensor.detach().cpu()
+    if not value.is_floating_point():
+        raise ValueError(f"{tensor_name} must use a floating-point dtype")
+    if value.dim() == 1 and value.shape[0] == num_tokens:
+        pass
+    elif value.dim() == 2 and tuple(value.shape) == (1, num_tokens):
+        value = value[0]
+    else:
+        raise ValueError(
+            f"{tensor_name} must have shape [{num_tokens}] or [1,{num_tokens}]: "
+            f"got {tuple(value.shape)}"
+        )
+    if not bool(torch.isfinite(value).all()):
+        raise ValueError(f"{tensor_name} contains NaN or infinity")
+    return value
+
+
+def _normalize_top_logprobs_tensor(
+    tensor: Any,
+    *,
+    tensor_name: str,
+    num_tokens: int,
+    floating_point: bool,
+) -> torch.Tensor:
+    value = tensor.detach().cpu()
+    if floating_point:
+        if not value.is_floating_point():
+            raise ValueError(f"{tensor_name} must use a floating-point dtype")
+    elif value.is_floating_point() or value.dtype == torch.bool:
+        raise ValueError(f"{tensor_name} must use an integer dtype")
+    if value.dim() == 3 and value.shape[0] == 1:
+        value = value[0]
+    if value.dim() != 2 or value.shape[0] != num_tokens:
+        raise ValueError(
+            f"{tensor_name} must have shape [num_output_tokens, top_logprobs]: "
+            f"got {tuple(value.shape)} for {num_tokens} tokens"
+        )
+    if floating_point and not bool(torch.isfinite(value).all()):
+        raise ValueError(f"{tensor_name} contains NaN or infinity")
+    if not floating_point and value.numel():
+        min_id = int(value.min().item())
+        max_id = int(value.max().item())
+        if min_id < -(1 << 31) or max_id >= (1 << 31):
+            raise ValueError(f"{tensor_name} contains values outside INT32 range")
+    return value
+
+
+def _append_tensor_output(
+    infer: predict_v2_pb2.ModelInferResponse,
+    *,
+    tensor_name: str,
+    datatype: str,
+    shape: list[int],
+    tensor: torch.Tensor,
+) -> None:
+    out = infer.outputs.add()
+    out.name = tensor_name
+    out.datatype = datatype
+    out.shape[:] = shape
+    if datatype == "FP32":
+        values = tensor.to(dtype=torch.float32).contiguous().reshape(-1).tolist()
+        raw = struct.pack(f"<{len(values)}f", *values) if values else b""
+    elif datatype == "INT32":
+        values = tensor.to(dtype=torch.int32).contiguous().reshape(-1).tolist()
+        raw = struct.pack(f"<{len(values)}i", *values) if values else b""
+    else:
+        raise ValueError(f"unsupported DashScope response datatype: {datatype}")
+    infer.raw_output_contents.append(raw)
+
+
+def _append_logprob_outputs(
+    infer: predict_v2_pb2.ModelInferResponse,
+    out_py: Any,
+    *,
+    num_tokens: int,
+    generate_config: Any,
+) -> None:
+    """Encode compact per-token logprob tensors on the DashScope wire.
+
+    Shapes retain the response batch dimension used by ``generated_ids``:
+    ``token_logprobs [1,L]`` and the two top-k tensors ``[1,L,K]``.
+    """
+    token_logprobs = getattr(out_py, "token_logprobs", None)
+    top_token_ids = getattr(out_py, "top_logprob_token_ids", None)
+    top_logprobs = getattr(out_py, "top_logprobs", None)
+    requested = bool(getattr(generate_config, "return_logprobs", False))
+    requested_k = int(getattr(generate_config, "top_logprobs", 0) or 0)
+
+    if token_logprobs is None:
+        if top_token_ids is not None or top_logprobs is not None:
+            raise ValueError("top-logprob tensors require token_logprobs")
+        if requested and num_tokens:
+            raise ValueError(
+                "token_logprobs is missing for a DashScope logprobs request"
+            )
+        return
+
+    token_values = _normalize_token_logprobs_tensor(
+        token_logprobs,
+        tensor_name="token_logprobs",
+        num_tokens=num_tokens,
+    )
+    _append_tensor_output(
+        infer,
+        tensor_name="token_logprobs",
+        datatype="FP32",
+        shape=[1, num_tokens],
+        tensor=token_values,
+    )
+
+    if (top_token_ids is None) != (top_logprobs is None):
+        raise ValueError(
+            "top_logprob_token_ids and top_logprobs must be returned together"
+        )
+    if top_token_ids is None:
+        if requested_k > 0 and num_tokens:
+            raise ValueError(
+                "top-logprob tensors are missing for a positive top_logprobs request"
+            )
+        return
+
+    top_id_values = _normalize_top_logprobs_tensor(
+        top_token_ids,
+        tensor_name="top_logprob_token_ids",
+        num_tokens=num_tokens,
+        floating_point=False,
+    )
+    top_prob_values = _normalize_top_logprobs_tensor(
+        top_logprobs,
+        tensor_name="top_logprobs",
+        num_tokens=num_tokens,
+        floating_point=True,
+    )
+    if top_id_values.shape != top_prob_values.shape:
+        raise ValueError(
+            "top_logprob_token_ids and top_logprobs must have identical shapes"
+        )
+    actual_k = int(top_id_values.shape[1])
+    if requested and actual_k > requested_k:
+        raise ValueError(
+            f"backend returned top_logprobs={actual_k}, exceeding requested "
+            f"top_logprobs={requested_k}"
+        )
+    _append_tensor_output(
+        infer,
+        tensor_name="top_logprob_token_ids",
+        datatype="INT32",
+        shape=[1, num_tokens, actual_k],
+        tensor=top_id_values,
+    )
+    _append_tensor_output(
+        infer,
+        tensor_name="top_logprobs",
+        datatype="FP32",
+        shape=[1, num_tokens, actual_k],
+        tensor=top_prob_values,
+    )
+
+
 def build_stream_response_from_generate_outputs(
     dash_sc_request_id: str,
     model_name: str,
@@ -1078,6 +1396,7 @@ def build_stream_response_from_generate_outputs(
     *,
     stream_finished: bool | None = None,
     token_ids: list[int] | None = None,
+    include_logprobs: bool = True,
 ) -> predict_v2_pb2.ModelStreamInferResponse:
     """Build ``ModelStreamInferResponse`` from one ``GenerateOutputs`` chunk.
 
@@ -1087,6 +1406,10 @@ def build_stream_response_from_generate_outputs(
 
     ``token_ids``: if provided, overrides the generated_ids from ``out_py``.
     Use when the servicer rewrites the token payload (e.g. injecting </think>).
+
+    ``include_logprobs``: synthetic frames (echoed prompt tokens or injected
+    thinking delimiters) have no model probability.  Such frames explicitly
+    omit all three logprob tensors instead of fabricating values.
     """
     del _request_shape  # reserved for future shape alignment
     if not go.generate_outputs:
@@ -1100,11 +1423,21 @@ def build_stream_response_from_generate_outputs(
 
     out_py = go.generate_outputs[0]
     finished = stream_finished if stream_finished is not None else out_py.finished
-    generated_ids = (
-        token_ids
-        if token_ids is not None
-        else _token_ids_list_from_generate_output(out_py)
-    )
+    backend_generated_ids = _token_ids_list_from_generate_output(out_py)
+    generated_ids = token_ids if token_ids is not None else backend_generated_ids
+    if (
+        include_logprobs
+        and token_ids is not None
+        and generated_ids != backend_generated_ids
+        and any(
+            getattr(out_py, name, None) is not None
+            for name in ("token_logprobs", "top_logprob_token_ids", "top_logprobs")
+        )
+    ):
+        raise ValueError(
+            "rewritten generated_ids require matching logprob tensor slicing or "
+            "include_logprobs=False"
+        )
 
     if return_input_ids and request_input_ids is not None:
         _append_prompt_token_ids_output(infer, request_input_ids)
@@ -1117,6 +1450,16 @@ def build_stream_response_from_generate_outputs(
         out_py,
         prompt_token_fallback=len(request_input_ids or []),
     )
+    # Append new optional tensors after the legacy response outputs so existing
+    # positional consumers retain their original indices. raw_output_contents
+    # stays one-to-one with outputs because each helper appends both together.
+    if include_logprobs:
+        _append_logprob_outputs(
+            infer,
+            out_py,
+            num_tokens=len(generated_ids),
+            generate_config=generate_config,
+        )
     infer.parameters["incremental_output"].int64_param = 1 if is_streaming else 0
     _append_dashllm_limit_parameters(
         infer,

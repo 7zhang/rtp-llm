@@ -4,8 +4,68 @@
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
 #include "rtp_llm/cpp/models/logits_processor/SpecLogitsVerifyRunner.h"
 #include "rtp_llm/cpp/normal_engine/speculative/SpeculativeSampler.h"
+#include <vector>
 
 namespace rtp_llm {
+
+// Target-model logprob state. Decode captures only a real-vocabulary view of
+// the raw LM-head output; after acceptance is known, bookkeeping selects the
+// emitted rows and computes reductions for those rows only. Eager prefill/tests
+// may populate row_logsumexp/top_logits before finalizeMtpTargetLogprobs().
+struct MtpTargetLogprobs {
+    torch::Tensor raw_logits;          // raw dtype [captured_target_positions, real_vocab_size]
+    torch::Tensor row_logsumexp;       // FP32 [selected_target_positions]
+    torch::Tensor top_logits;          // raw dtype [selected_target_positions, max_k]
+    torch::Tensor source_row_indices;  // INT64 [selected_target_positions], undefined means all rows
+    // Pinned H2D source for sparse CUDA indices. Kept through dispatch so the
+    // non-blocking copy cannot outlive its host allocation.
+    torch::Tensor source_row_indices_cpu_owner;
+    torch::Tensor token_logprobs;         // FP32 [selected_target_positions], defined after finalize
+    torch::Tensor top_logprob_token_ids;  // INT32 [selected_target_positions, max_k]
+    torch::Tensor top_logprobs;           // FP32 [selected_target_positions, max_k]
+    int64_t       requested_top_logprobs = 0;
+
+    bool defined() const {
+        return raw_logits.defined() || token_logprobs.defined();
+    }
+
+    bool finalized() const {
+        return token_logprobs.defined() && !raw_logits.defined() && !row_logsumexp.defined() && !top_logits.defined()
+               && !source_row_indices.defined();
+    }
+
+    int64_t maxTopLogprobs() const {
+        if (top_logprobs.defined()) {
+            return top_logprobs.size(1);
+        }
+        return top_logits.defined() ? top_logits.size(1) : requested_top_logprobs;
+    }
+};
+
+// O(1) decode capture: no row selection, logsumexp, or top-k is launched.
+MtpTargetLogprobs
+captureMtpTargetLogprobs(const torch::Tensor& logits, int64_t max_top_logprobs, int64_t real_vocab_size);
+
+MtpTargetLogprobs computeMtpTargetLogprobs(const torch::Tensor&        logits,
+                                           int64_t                     max_top_logprobs,
+                                           int64_t                     real_vocab_size,
+                                           const std::vector<int64_t>& source_row_indices = {});
+
+void finalizeMtpTargetLogprobs(MtpTargetLogprobs&   target_logprobs,
+                               const torch::Tensor& emitted_token_ids,
+                               const torch::Tensor& raw_logits_override = torch::Tensor());
+
+// Select final emitted rows, then compute logsumexp/top-k/selected-token
+// logprobs only for those rows. emitted_token_ids retains the dense target-row
+// layout and is compacted with the same source_row_indices.
+void finalizeSelectedMtpTargetLogprobs(MtpTargetLogprobs&          target_logprobs,
+                                       const torch::Tensor&        emitted_token_ids,
+                                       const std::vector<int64_t>& source_row_indices);
+
+torch::Tensor reshapeMtpTargetAllProbs(const torch::Tensor& all_probs,
+                                       int64_t              batch_size,
+                                       int64_t              positions_per_batch,
+                                       int64_t              logits_width);
 
 class MtpBatchStreamProcessor: public NormalBatchStreamProcessor {
 public:
@@ -27,9 +87,20 @@ public:
                                  const MergedOutput&  propose_output,
                                  const torch::Tensor& draft_last_hidden_states) const;
 
+    absl::Status dispatchPrefill(const StreamGroups&      stream_groups,
+                                 const MergedOutput&      prefill_output,
+                                 const MergedOutput&      propose_output,
+                                 const torch::Tensor&     draft_last_hidden_states,
+                                 const MtpTargetLogprobs& target_logprobs) const;
+
     absl::Status dispatchDecode(const StreamGroups&                          stream_groups,
                                 const speculative::SpeculativeSamplerOutput& spec_decode_output,
                                 const MergedOutput&                          draft_prefill_output) const;
+
+    absl::Status dispatchDecode(const StreamGroups&                          stream_groups,
+                                const speculative::SpeculativeSamplerOutput& spec_decode_output,
+                                const MergedOutput&                          draft_prefill_output,
+                                MtpTargetLogprobs                            target_logprobs) const;
 
     absl::StatusOr<GptModelInputs> gatherDecodeModelInput(const StreamGroups& stream_groups,
                                                           TensorHolder&       host_holder) const;
@@ -93,12 +164,14 @@ protected:
                                       const MergedOutput&                prefill_output,
                                       const MergedOutput&                propose_output,
                                       const torch::Tensor&               draft_last_hidden_states,
+                                      const MtpTargetLogprobs&           target_logprobs,
                                       const torch::Tensor&               new_tokens_all,
                                       std::vector<StreamSpecUpdateInfo>& spec_update_infos) const;
 
     void prepareDecodeSpecUpdateInfo(const StreamGroups&                          stream_groups,
                                      const speculative::SpeculativeSamplerOutput& spec_decode_output,
                                      const MergedOutput&                          draft_prefill_output,
+                                     MtpTargetLogprobs&                           target_logprobs,
                                      std::vector<StreamSpecUpdateInfo>&           spec_update_infos) const;
 
     void gatherHiddenStates(const StreamGroups& stream_groups, GptModelInputs& model_input) const;

@@ -159,6 +159,43 @@ class RemoveStopWordIdsTest(TestCase):
 
 
 class MergeGenerateOutputsTest(TestCase):
+    def test_empty_terminal_concatenates_logprob_tensors(self):
+        renderer = CustomChatRenderer.__new__(CustomChatRenderer)
+        token_output = GenerateOutput(
+            output_ids=torch.tensor([[10, 11]], dtype=torch.int32),
+            token_logprobs=torch.tensor([-0.1, -0.2], dtype=torch.float32),
+            top_logprob_token_ids=torch.tensor([[10, 12], [11, 13]], dtype=torch.int32),
+            top_logprobs=torch.tensor(
+                [[-0.1, -1.1], [-0.2, -1.2]], dtype=torch.float32
+            ),
+            aux_info=AuxInfo(output_len=2, step_output_len=2),
+            finished=False,
+        )
+        terminal_output = GenerateOutput(
+            output_ids=torch.empty((1, 0), dtype=torch.int32),
+            token_logprobs=torch.empty((0,), dtype=torch.float32),
+            top_logprob_token_ids=torch.empty((0, 2), dtype=torch.int32),
+            top_logprobs=torch.empty((0, 2), dtype=torch.float32),
+            aux_info=AuxInfo(output_len=2, step_output_len=0),
+            finished=True,
+        )
+
+        merged = renderer._merge_generate_outputs(
+            [
+                GenerateOutputs(generate_outputs=[token_output]),
+                GenerateOutputs(generate_outputs=[terminal_output]),
+            ]
+        ).generate_outputs[0]
+
+        self.assertEqual(merged.output_ids.tolist(), [[10, 11]])
+        self.assertTrue(torch.equal(merged.token_logprobs, token_output.token_logprobs))
+        self.assertTrue(
+            torch.equal(
+                merged.top_logprob_token_ids, token_output.top_logprob_token_ids
+            )
+        )
+        self.assertTrue(torch.equal(merged.top_logprobs, token_output.top_logprobs))
+
     def test_empty_terminal_preserves_latest_nonempty_output_metadata(self):
         renderer = CustomChatRenderer.__new__(CustomChatRenderer)
         token_aux = AuxInfo(

@@ -441,6 +441,74 @@ class QwenTestTokenizer(BaseTokenizer):
         self.im_end_id = self.tokenizer.im_end_id
 
 
+class CompactLogprobTestTokenizer:
+    _pieces = {
+        1: "A",
+        2: "B",
+        3: "<",
+        4: "STOP>",
+        8: "",
+        10: "x",
+        11: "y",
+        12: "z",
+        13: "A\ufffd",
+    }
+
+    def decode(self, token_ids):
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.flatten().tolist()
+        token_ids = list(token_ids)
+        result = ""
+        index = 0
+        while index < len(token_ids):
+            if token_ids[index : index + 2] == [7, 8]:
+                result += "你"
+                index += 2
+            elif token_ids[index] == 7:
+                result += "\ufffd"
+                index += 1
+            else:
+                result += self._pieces.get(token_ids[index], str(token_ids[index]))
+                index += 1
+        return result
+
+    def convert_tokens_to_ids(self, word):
+        return None
+
+
+def create_compact_logprob_renderer(stop_word_ids=None):
+    return custom_renderer.CustomChatRenderer(
+        CompactLogprobTestTokenizer(),
+        custom_renderer.RendererParams(
+            model_type="compact_logprob_test",
+            max_seq_len=128,
+            eos_token_id=99,
+            stop_word_ids_list=stop_word_ids or [],
+        ),
+        GenerateEnvConfig(),
+    )
+
+
+def make_compact_logprob_output(
+    token_ids, token_logprobs, top_token_ids=None, top_logprobs=None
+):
+    return GenerateOutput(
+        output_ids=torch.tensor([token_ids], dtype=torch.int32),
+        token_logprobs=torch.tensor([token_logprobs], dtype=torch.float32),
+        top_logprob_token_ids=(
+            torch.tensor([top_token_ids], dtype=torch.int32)
+            if top_token_ids is not None
+            else None
+        ),
+        top_logprobs=(
+            torch.tensor([top_logprobs], dtype=torch.float32)
+            if top_logprobs is not None
+            else None
+        ),
+        aux_info=AuxInfo(input_len=3, output_len=len(token_ids)),
+    )
+
+
 class OpenaiResponseTest(IsolatedAsyncioTestCase):
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
@@ -454,6 +522,404 @@ class OpenaiResponseTest(IsolatedAsyncioTestCase):
         self.model_config.max_seq_len = 1024
         self.model_config.vocab_size = 1024
         self.model_config.special_tokens = SpecialTokens()
+
+    async def test_compact_logprobs_mtp_stop_has_no_leak_or_duplicate(self):
+        renderer = create_compact_logprob_renderer([[3, 4]])
+        request = ChatCompletionRequest(
+            messages=[], stream=True, logprobs=True, top_logprobs=0
+        )
+        status = custom_renderer.StreamStatus(request)
+        stop_words = ["<STOP>"]
+        stop_slices = custom_renderer.get_stop_word_slices(stop_words)
+
+        buffered = await renderer._update_single_status(
+            status,
+            make_compact_logprob_output([1, 3], [-0.1, -0.3]),
+            16,
+            stop_words,
+            stop_slices,
+            True,
+        )
+        self.assertEqual(buffered.output_str, "")
+        self.assertIsNone(buffered.logprobs)
+        self.assertEqual(len(status.pending_logprobs), 2)
+
+        visible = await renderer._update_single_status(
+            status,
+            make_compact_logprob_output([4], [-0.4]),
+            16,
+            stop_words,
+            stop_slices,
+            True,
+        )
+        self.assertEqual(visible.output_str, "A")
+        self.assertEqual([item.token for item in visible.logprobs], ["A"])
+        self.assertAlmostEqual(visible.logprobs[0].logprob, -0.1, places=6)
+
+        response = await renderer._generate_stream_response(
+            [visible], [custom_renderer.ThinkStatus()]
+        )
+        self.assertEqual(len(response.choices[0].logprobs.content), 1)
+
+        flushed = await renderer._flush_buffer(
+            [status], stop_words, True, [custom_renderer.ThinkStatus()]
+        )
+        self.assertIsNone(flushed.choices[0].logprobs)
+
+    async def test_compact_logprobs_utf8_buffering_and_top_k(self):
+        renderer = create_compact_logprob_renderer()
+        request = ChatCompletionRequest(
+            messages=[], stream=True, logprobs=True, top_logprobs=2
+        )
+        status = custom_renderer.StreamStatus(request)
+
+        buffered = await renderer._update_single_status(
+            status,
+            make_compact_logprob_output([7], [-0.7], [[10, 11]], [[-1.0, -2.0]]),
+            16,
+            [],
+            [],
+            True,
+        )
+        self.assertIsNone(buffered.logprobs)
+
+        visible = await renderer._update_single_status(
+            status,
+            make_compact_logprob_output([8], [-0.8], [[11, 12]], [[-1.1, -2.1]]),
+            16,
+            [],
+            [],
+            True,
+        )
+        self.assertEqual(visible.output_str, "你")
+        self.assertEqual(len(visible.logprobs), 2)
+        self.assertEqual([len(item.top_logprobs) for item in visible.logprobs], [2, 2])
+        self.assertEqual(status.pending_logprobs, [])
+
+    async def test_compact_logprobs_terminal_utf8_emits_valid_prefix(self):
+        renderer = create_compact_logprob_renderer()
+
+        for is_streaming in (False, True):
+            with self.subTest(is_streaming=is_streaming):
+                request = ChatCompletionRequest(
+                    messages=[],
+                    stream=is_streaming,
+                    logprobs=True,
+                    top_logprobs=0,
+                )
+                status = custom_renderer.StreamStatus(request)
+
+                terminal = await renderer._update_single_status(
+                    status,
+                    make_compact_logprob_output([1, 7], [-0.1, -0.7]),
+                    2,
+                    [],
+                    [],
+                    is_streaming,
+                )
+
+                self.assertEqual(status.finish_reason, FinisheReason.length)
+                self.assertEqual(terminal.output_str, "A")
+                self.assertEqual([item.token for item in terminal.logprobs], ["A"])
+                self.assertEqual(status.pending_logprobs, [])
+
+                flushed = await renderer._flush_buffer(
+                    [status], [], is_streaming, [custom_renderer.ThinkStatus()]
+                )
+                self.assertEqual(flushed.choices[0].delta.content, "")
+                self.assertIsNone(flushed.choices[0].logprobs)
+
+    async def test_compact_logprobs_terminal_utf8_keeps_cross_chunk_character(self):
+        renderer = create_compact_logprob_renderer()
+        request = ChatCompletionRequest(
+            messages=[], stream=True, logprobs=True, top_logprobs=0
+        )
+        status = custom_renderer.StreamStatus(request)
+
+        buffered = await renderer._update_single_status(
+            status,
+            make_compact_logprob_output([7], [-0.7]),
+            3,
+            [],
+            [],
+            True,
+        )
+        self.assertEqual(buffered.output_str, "")
+        self.assertIsNone(buffered.logprobs)
+
+        terminal = await renderer._update_single_status(
+            status,
+            make_compact_logprob_output([8, 7], [-0.8, -0.9]),
+            3,
+            [],
+            [],
+            True,
+        )
+        self.assertEqual(status.finish_reason, FinisheReason.length)
+        self.assertEqual(terminal.output_str, "你")
+        self.assertEqual(len(terminal.logprobs), 2)
+        self.assertEqual(
+            [round(item.logprob, 1) for item in terminal.logprobs], [-0.7, -0.8]
+        )
+        self.assertEqual(status.pending_logprobs, [])
+
+    async def test_compact_logprobs_terminal_utf8_keeps_partially_visible_token(self):
+        renderer = create_compact_logprob_renderer()
+        request = ChatCompletionRequest(
+            messages=[], stream=True, logprobs=True, top_logprobs=0
+        )
+        status = custom_renderer.StreamStatus(request)
+
+        terminal = await renderer._update_single_status(
+            status,
+            make_compact_logprob_output([13], [-1.3]),
+            1,
+            [],
+            [],
+            True,
+        )
+
+        self.assertEqual(status.finish_reason, FinisheReason.length)
+        self.assertEqual(terminal.output_str, "A")
+        self.assertEqual(len(terminal.logprobs), 1)
+        self.assertEqual(terminal.logprobs[0].token, "A\ufffd")
+        self.assertAlmostEqual(terminal.logprobs[0].logprob, -1.3, places=6)
+        self.assertEqual(status.pending_logprobs, [])
+
+    def test_compact_logprobs_sync_multi_token_and_status_update(self):
+        renderer = create_compact_logprob_renderer()
+        request = ChatCompletionRequest(
+            messages=[], stream=True, logprobs=True, top_logprobs=2
+        )
+        status = custom_renderer.StreamStatusSync(request)
+        delta = renderer._update_single_status_sync(
+            status,
+            3,
+            2,
+            0,
+            torch.tensor([[-0.1, -0.2]], dtype=torch.float32),
+            torch.tensor([[[10, 11], [11, 12]]], dtype=torch.int32),
+            torch.tensor([[[-1.0, -2.0], [-1.1, -2.1]]], dtype=torch.float32),
+            torch.tensor([[1, 2]], dtype=torch.int32),
+            16,
+            [],
+            [],
+            True,
+        )
+        self.assertEqual(delta.output_str, "AB")
+        self.assertEqual(len(delta.logprobs), 2)
+        self.assertEqual(status.output_ids, [1, 2])
+
+    def test_compact_logprobs_sync_non_streaming_buffers_utf8(self):
+        renderer = create_compact_logprob_renderer()
+        request = ChatCompletionRequest(
+            messages=[], stream=False, logprobs=True, top_logprobs=0
+        )
+        status = custom_renderer.StreamStatusSync(request)
+
+        first = renderer._update_single_status_sync(
+            status,
+            3,
+            1,
+            0,
+            torch.tensor([[-0.7]], dtype=torch.float32),
+            torch.empty((1, 1, 0), dtype=torch.int32),
+            torch.empty((1, 1, 0), dtype=torch.float32),
+            torch.tensor([[7]], dtype=torch.int32),
+            16,
+            [],
+            [],
+            False,
+        )
+        self.assertEqual(first.output_str, "")
+        self.assertIsNone(first.logprobs)
+        self.assertEqual(status.last_output_ids, [])
+        self.assertEqual(len(status.pending_logprobs), 1)
+
+        second = renderer._update_single_status_sync(
+            status,
+            3,
+            2,
+            0,
+            torch.tensor([[-0.8]], dtype=torch.float32),
+            torch.empty((1, 1, 0), dtype=torch.int32),
+            torch.empty((1, 1, 0), dtype=torch.float32),
+            torch.tensor([[8]], dtype=torch.int32),
+            16,
+            [],
+            [],
+            False,
+        )
+        self.assertEqual(second.output_str, "你")
+        self.assertAlmostEqual(second.logprobs[0].logprob, -0.7, places=6)
+        self.assertAlmostEqual(second.logprobs[1].logprob, -0.8, places=6)
+        self.assertEqual(status.last_output_ids, [7, 8])
+        self.assertEqual(status.pending_logprobs, [])
+
+    def test_compact_logprobs_sync_terminal_utf8_emits_valid_prefix(self):
+        renderer = create_compact_logprob_renderer()
+
+        for is_streaming in (False, True):
+            with self.subTest(is_streaming=is_streaming):
+                request = ChatCompletionRequest(
+                    messages=[],
+                    stream=is_streaming,
+                    logprobs=True,
+                    top_logprobs=0,
+                )
+                status = custom_renderer.StreamStatusSync(request)
+
+                terminal = renderer._update_single_status_sync(
+                    status,
+                    3,
+                    2,
+                    0,
+                    torch.tensor([[-0.1, -0.7]], dtype=torch.float32),
+                    torch.empty((1, 2, 0), dtype=torch.int32),
+                    torch.empty((1, 2, 0), dtype=torch.float32),
+                    torch.tensor([[1, 7]], dtype=torch.int32),
+                    2,
+                    [],
+                    [],
+                    is_streaming,
+                )
+
+                self.assertEqual(status.finish_reason, FinisheReason.length)
+                self.assertEqual(terminal.output_str, "A")
+                self.assertEqual([item.token for item in terminal.logprobs], ["A"])
+                self.assertEqual(status.pending_logprobs, [])
+
+    def test_compact_logprobs_sync_terminal_utf8_keeps_cross_chunk_character(self):
+        renderer = create_compact_logprob_renderer()
+        request = ChatCompletionRequest(
+            messages=[], stream=True, logprobs=True, top_logprobs=0
+        )
+        status = custom_renderer.StreamStatusSync(request)
+
+        buffered = renderer._update_single_status_sync(
+            status,
+            3,
+            1,
+            0,
+            torch.tensor([[-0.7]], dtype=torch.float32),
+            torch.empty((1, 1, 0), dtype=torch.int32),
+            torch.empty((1, 1, 0), dtype=torch.float32),
+            torch.tensor([[7]], dtype=torch.int32),
+            3,
+            [],
+            [],
+            True,
+        )
+        self.assertEqual(buffered.output_str, "")
+        self.assertIsNone(buffered.logprobs)
+
+        terminal = renderer._update_single_status_sync(
+            status,
+            3,
+            3,
+            0,
+            torch.tensor([[-0.8, -0.9]], dtype=torch.float32),
+            torch.empty((1, 2, 0), dtype=torch.int32),
+            torch.empty((1, 2, 0), dtype=torch.float32),
+            torch.tensor([[8, 7]], dtype=torch.int32),
+            3,
+            [],
+            [],
+            True,
+        )
+        self.assertEqual(status.finish_reason, FinisheReason.length)
+        self.assertEqual(terminal.output_str, "你")
+        self.assertEqual(len(terminal.logprobs), 2)
+        self.assertEqual(
+            [round(item.logprob, 1) for item in terminal.logprobs], [-0.7, -0.8]
+        )
+        self.assertEqual(status.pending_logprobs, [])
+
+    def test_compact_logprobs_sync_terminal_utf8_keeps_partially_visible_token(self):
+        renderer = create_compact_logprob_renderer()
+        request = ChatCompletionRequest(
+            messages=[], stream=True, logprobs=True, top_logprobs=0
+        )
+        status = custom_renderer.StreamStatusSync(request)
+
+        terminal = renderer._update_single_status_sync(
+            status,
+            3,
+            1,
+            0,
+            torch.tensor([[-1.3]], dtype=torch.float32),
+            torch.empty((1, 1, 0), dtype=torch.int32),
+            torch.empty((1, 1, 0), dtype=torch.float32),
+            torch.tensor([[13]], dtype=torch.int32),
+            1,
+            [],
+            [],
+            True,
+        )
+
+        self.assertEqual(status.finish_reason, FinisheReason.length)
+        self.assertEqual(terminal.output_str, "A")
+        self.assertEqual(len(terminal.logprobs), 1)
+        self.assertEqual(terminal.logprobs[0].token, "A\ufffd")
+        self.assertAlmostEqual(terminal.logprobs[0].logprob, -1.3, places=6)
+        self.assertEqual(status.pending_logprobs, [])
+
+    def test_compact_logprobs_sync_buffers_empty_token(self):
+        renderer = create_compact_logprob_renderer()
+        request = ChatCompletionRequest(
+            messages=[], stream=False, logprobs=True, top_logprobs=0
+        )
+        status = custom_renderer.StreamStatusSync(request)
+
+        first = renderer._update_single_status_sync(
+            status,
+            3,
+            1,
+            0,
+            torch.tensor([[-0.8]], dtype=torch.float32),
+            torch.empty((1, 1, 0), dtype=torch.int32),
+            torch.empty((1, 1, 0), dtype=torch.float32),
+            torch.tensor([[8]], dtype=torch.int32),
+            16,
+            [],
+            [],
+            False,
+        )
+        self.assertEqual(first.output_str, "")
+        self.assertIsNone(first.logprobs)
+        self.assertEqual(status.last_output_ids, [])
+
+        second = renderer._update_single_status_sync(
+            status,
+            3,
+            2,
+            0,
+            torch.tensor([[-0.1]], dtype=torch.float32),
+            torch.empty((1, 1, 0), dtype=torch.int32),
+            torch.empty((1, 1, 0), dtype=torch.float32),
+            torch.tensor([[1]], dtype=torch.int32),
+            16,
+            [],
+            [],
+            False,
+        )
+        self.assertEqual(second.output_str, "A")
+        self.assertEqual([item.token for item in second.logprobs], ["", "A"])
+        self.assertEqual(status.last_output_ids, [8, 1])
+
+    def test_compact_logprobs_accepts_vocab_clamped_top_k(self):
+        renderer = create_compact_logprob_renderer()
+        request = ChatCompletionRequest(messages=[], logprobs=True, top_logprobs=3)
+
+        records = renderer._generate_log_probs_from_tensors(
+            request,
+            torch.tensor([[1, 2]], dtype=torch.int32),
+            torch.tensor([[-0.1, -0.2]], dtype=torch.float32),
+            torch.tensor([[[10, 11], [11, 12]]], dtype=torch.int32),
+            torch.tensor([[[-1.0, -2.0], [-1.1, -2.1]]], dtype=torch.float32),
+        )
+
+        self.assertEqual([len(item.top_logprobs) for item in records], [2, 2])
 
     async def test_parse_qwen_function_call(self):
         tokenizer = QwenTestTokenizer(

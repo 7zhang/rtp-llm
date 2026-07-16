@@ -121,6 +121,7 @@ protected:
     absl::Status dispatchDecodeOutput(const StreamGroups&                          stream_groups,
                                       const std::list<GenerateStreamPtr>&          streams,
                                       const speculative::SpeculativeSamplerOutput& speculative_sampler_output,
+                                      MtpTargetLogprobs                            target_logprobs,
                                       GptModelOutputs                              draft_prefill_model_output,
                                       SamplerOutput                                draft_prefill_sampler_output,
                                       std::shared_ptr<torch::Event>                rejection_event,
@@ -175,6 +176,7 @@ protected:
     // the main thread.
     absl::Status dispatchDecodeAsync(const StreamGroups&                          stream_groups,
                                      const speculative::SpeculativeSamplerOutput& spec_decode_output,
+                                     MtpTargetLogprobs                            target_logprobs,
                                      MergedOutput                                 draft_prefill_output,
                                      std::shared_ptr<torch::Event>                rejection_event,
                                      std::shared_ptr<torch::Event>                draft_event);
@@ -186,6 +188,11 @@ protected:
                                    const MergedOutput&                          draft_prefill_output);
 
     void releaseAllModelBuffers();
+
+    // Decode logprob bookkeeping temporarily owns the target LM-head output.
+    // Before another target forward can allocate logits, wait only when the
+    // previous async payload actually carried that large tensor.
+    void syncPendingAsyncLogprobBookkeeping();
 
 private:
     std::unique_ptr<ModelBase>                                               model_;
@@ -247,6 +254,10 @@ private:
     // Bookkeeping worker for stream-async decode dispatch. It owns a CUDA
     // stream + thread and runs D2H/specUpdate/KV release off the main thread.
     AsyncRunner spec_bookkeeping_runner_;
+
+    // Main executor thread only. Track the previous payload rather than the
+    // current stream list because its requesting stream may already be gone.
+    bool pending_async_logprob_bookkeeping_ = false;
 
     std::atomic<bool> stop_requested_{false};
 };

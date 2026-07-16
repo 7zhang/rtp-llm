@@ -148,6 +148,27 @@ def _merge_choice_softmax_probs(
     return merged_softmax_probs or None
 
 
+def _merge_choice_logprob_tensors(
+    outputs_list: List[GenerateOutputs], choice_index: int
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    merged_tensors: List[Optional[torch.Tensor]] = []
+    for field_name in (
+        "token_logprobs",
+        "top_logprob_token_ids",
+        "top_logprobs",
+    ):
+        chunks = []
+        for outputs in outputs_list:
+            if choice_index >= len(outputs.generate_outputs):
+                continue
+            value = getattr(outputs.generate_outputs[choice_index], field_name)
+            if value is not None:
+                chunks.append(value)
+        merged_tensors.append(torch.cat(chunks, dim=0) if chunks else None)
+
+    return merged_tensors[0], merged_tensors[1], merged_tensors[2]
+
+
 def _postprocess_backfilled_hidden_states(
     merged_output: GenerateOutput,
     generate_config: Optional[GenerateConfig],
@@ -205,6 +226,8 @@ class StreamStatus:
 
     def __init__(self, request: ChatCompletionRequest):
         self.request = request
+        self.pending_logprobs: List[ChatCompletionTokenLogprob] = []
+        self.emitted_logprob_token_count = 0
 
     def update_output(
         self,
@@ -278,6 +301,8 @@ class StreamStatusSync:
 
     def __init__(self, request: ChatCompletionRequest):
         self.request = request
+        self.pending_logprobs: List[ChatCompletionTokenLogprob] = []
+        self.emitted_logprob_token_count = 0
 
     def update_output_sync(
         self,
@@ -287,7 +312,7 @@ class StreamStatusSync:
         remove_stop_word_ids_func,
     ):
         self.index += 1
-        delta_output_ids = output.output_ids.cpu().flatten().tolist()
+        delta_output_ids = output_ids.cpu().flatten().tolist()
         self.output_ids_list = copy.deepcopy(self.output_ids_list + delta_output_ids)
         self.finish_reason = check_finish_func(self.output_ids_list, input_len)
         self.output_ids = remove_stop_word_ids_func(
@@ -344,7 +369,7 @@ class RendererParams:
 @dataclass
 class OutputDelta:
     output_str: Union[str, DeltaMessage]
-    logprobs: Optional[ChatCompletionTokenLogprob]
+    logprobs: Optional[List[ChatCompletionTokenLogprob]]
     input_length: int
     output_length: int
     reuse_length: int
@@ -643,6 +668,11 @@ class CustomChatRenderer:
             # 深拷贝final_output并只替换output_ids
             merged_output = copy.deepcopy(final_output)
             merged_output.output_ids = merged_output_ids
+            (
+                merged_output.token_logprobs,
+                merged_output.top_logprob_token_ids,
+                merged_output.top_logprobs,
+            ) = _merge_choice_logprob_tensors(collected_outputs_list, i)
 
             # A state-only terminal may omit optional payloads. Preserve its
             # final status/aux counters while recovering the latest available
@@ -669,60 +699,320 @@ class CustomChatRenderer:
 
         return GenerateOutputs(generate_outputs=merged_generate_outputs)
 
-    async def _create_empty_delta(self, aux_info: AuxInfo):
+    async def _create_empty_delta(
+        self,
+        aux_info: AuxInfo,
+        logprobs: Optional[List[ChatCompletionTokenLogprob]] = None,
+    ):
         return OutputDelta(
             output_str="",
-            logprobs=None,
+            logprobs=logprobs,
             input_length=aux_info.input_len,
             output_length=aux_info.output_len,
             reuse_length=aux_info.reuse_len,
         )
 
-    async def _generate_log_probs(
-        self, status: StreamStatus, output: Optional[GenerateOutput]
-    ) -> Optional[ChatCompletionTokenLogprob]:
-        assert output is not None
-        if not status.request.logprobs:
+    def _generate_log_probs_from_tensors(
+        self,
+        request: ChatCompletionRequest,
+        output_ids: Optional[torch.Tensor],
+        token_logprobs: Optional[torch.Tensor],
+        top_logprob_token_ids: Optional[torch.Tensor],
+        top_logprobs: Optional[torch.Tensor],
+        token_count: Optional[int] = None,
+    ) -> Optional[List[ChatCompletionTokenLogprob]]:
+        if not request.logprobs:
             return None
-        prob_return_num = status.request.top_logprobs or 1
-        all_probs = output.all_probs
-        output_id = output.output_ids
-        if output_id == None:
+        if output_ids is None:
             return None
-        selected_id = output_id[-1].item()
-        if all_probs == None:
-            raise Exception(
-                "all_probs is None when logprobs is true. There should be a internal bug."
+        if token_logprobs is None:
+            raise RuntimeError(
+                "token_logprobs is None when logprobs is true; this is an internal bug"
             )
-        all_probs = all_probs.squeeze()
-        non_zero_size = all_probs.nonzero().shape[0]
-        prob_return_num = min(prob_return_num, non_zero_size)
-        # 使用 topk 提高计算效率，只计算需要的前 k 个值
-        probs, tokens = all_probs.topk(
-            prob_return_num, dim=-1, largest=True, sorted=True
-        )
-        log_values = probs.log()
 
-        selected_token = self.tokenizer.decode([selected_id])
-        chat_logprob = ChatCompletionTokenLogprob(
-            token=selected_token,
-            bytes=list(selected_token.encode("utf-8", errors="replace")),
-            logprob=all_probs[output_id].log().item(),
-            top_logprobs=[],
-        )
-        for i in range(prob_return_num):
-            token = self.tokenizer.decode(tokens[i].item())
-            chat_logprob.top_logprobs.append(
-                TopLogprob(
-                    token=token,
-                    logprob=log_values[i].item(),
-                    bytes=list(token.encode("utf-8", errors="replace")),
+        if output_ids.dtype == torch.bool or output_ids.is_floating_point():
+            raise RuntimeError("output_ids must use an integer dtype")
+        if not token_logprobs.is_floating_point():
+            raise RuntimeError("token_logprobs must use a floating-point dtype")
+
+        output_id_values = output_ids.detach().cpu().reshape(-1)
+        raw_token_count = output_id_values.numel()
+        if token_count is not None:
+            if token_count < 0 or token_count > raw_token_count:
+                raise RuntimeError(
+                    f"invalid logprob token_count={token_count}, output token count={raw_token_count}"
                 )
+            output_id_values = output_id_values[:token_count]
+
+        num_tokens = output_id_values.numel()
+        if num_tokens == 0:
+            return None
+
+        token_logprob_values = token_logprobs.detach().cpu().reshape(-1)
+        if token_logprob_values.numel() != raw_token_count:
+            raise RuntimeError(
+                "token_logprobs must align one-to-one with output_ids: "
+                f"got {token_logprob_values.numel()} values for {raw_token_count} tokens"
+            )
+        token_logprob_values = token_logprob_values[:num_tokens]
+
+        requested_k = request.top_logprobs if request.top_logprobs is not None else 0
+        actual_k = 0
+        top_token_values: Optional[torch.Tensor] = None
+        top_logprob_values: Optional[torch.Tensor] = None
+        if requested_k > 0:
+            if top_logprob_token_ids is None or top_logprobs is None:
+                raise RuntimeError(
+                    "top-logprob tensors are missing when top_logprobs is positive"
+                )
+            if (
+                top_logprob_token_ids.dtype == torch.bool
+                or top_logprob_token_ids.is_floating_point()
+            ):
+                raise RuntimeError("top_logprob_token_ids must use an integer dtype")
+            if not top_logprobs.is_floating_point():
+                raise RuntimeError("top_logprobs must use a floating-point dtype")
+            if top_logprob_token_ids.shape != top_logprobs.shape:
+                raise RuntimeError(
+                    "top-logprob token ids and values must have the same shape"
+                )
+            if top_logprob_token_ids.dim() < 2:
+                raise RuntimeError(
+                    "top-logprob tensors must have shape [num_output_tokens, top_logprobs]"
+                )
+            actual_k = top_logprob_token_ids.shape[-1]
+            if actual_k > requested_k:
+                raise RuntimeError(
+                    f"backend returned top_logprobs={actual_k}, exceeding requested {requested_k}"
+                )
+            leading_token_count = top_logprob_token_ids.numel() // max(actual_k, 1)
+            if actual_k == 0:
+                leading_token_count = 1
+                for dimension in top_logprob_token_ids.shape[:-1]:
+                    leading_token_count *= dimension
+            if leading_token_count != raw_token_count:
+                raise RuntimeError(
+                    "top-logprob tensors must align with the output token dimension"
+                )
+            top_token_values = (
+                top_logprob_token_ids.detach()
+                .cpu()
+                .reshape(raw_token_count, actual_k)[:num_tokens]
+            )
+            top_logprob_values = (
+                top_logprobs.detach()
+                .cpu()
+                .reshape(raw_token_count, actual_k)[:num_tokens]
             )
 
-        logging.debug("chat_logprob: %s", chat_logprob.model_dump_json(indent=4))
+        result: List[ChatCompletionTokenLogprob] = []
+        for token_index, (token_id_tensor, token_logprob_tensor) in enumerate(
+            zip(output_id_values, token_logprob_values)
+        ):
+            token_id = token_id_tensor.item()
+            token = self.tokenizer.decode([token_id])
+            token_result = ChatCompletionTokenLogprob(
+                token=token,
+                bytes=list(token.encode("utf-8", errors="replace")),
+                logprob=token_logprob_tensor.item(),
+                top_logprobs=[],
+            )
+            if actual_k > 0:
+                assert top_token_values is not None
+                assert top_logprob_values is not None
+                for top_token_id, top_logprob in zip(
+                    top_token_values[token_index], top_logprob_values[token_index]
+                ):
+                    top_token = self.tokenizer.decode([top_token_id.item()])
+                    token_result.top_logprobs.append(
+                        TopLogprob(
+                            token=top_token,
+                            logprob=top_logprob.item(),
+                            bytes=list(top_token.encode("utf-8", errors="replace")),
+                        )
+                    )
+            result.append(token_result)
 
-        return chat_logprob
+        logging.debug("chat_logprobs: %s", result)
+        return result
+
+    def _accumulate_log_probs_from_tensors(
+        self,
+        status: Union[StreamStatus, StreamStatusSync],
+        output_ids: Optional[torch.Tensor],
+        token_logprobs: Optional[torch.Tensor],
+        top_logprob_token_ids: Optional[torch.Tensor],
+        top_logprobs: Optional[torch.Tensor],
+    ) -> None:
+        """Append logprobs for retained tokens and keep them pending until visible.
+
+        A streamed chunk may contain several speculative tokens.  Stop-word
+        handling can retain only a prefix of that chunk, while UTF-8 and partial
+        stop-word handling can delay the corresponding text.  Keeping the
+        records on the status makes logprobs follow the same visibility rules as
+        text and prevents them from being emitted twice by the final flush.
+        """
+        if not status.request.logprobs:
+            return
+
+        retained_token_count = len(status.output_ids)
+        emitted_token_count = status.emitted_logprob_token_count
+        if retained_token_count < emitted_token_count:
+            # This can only happen if a multi-token stop word retracts a prefix
+            # that was already exposed.  Text cannot be retracted either, so keep
+            # the status internally consistent and make the condition visible.
+            logging.warning(
+                "retained token count %s is smaller than emitted logprob count %s",
+                retained_token_count,
+                emitted_token_count,
+            )
+            status.pending_logprobs = []
+            status.emitted_logprob_token_count = retained_token_count
+            emitted_token_count = retained_token_count
+
+        allowed_pending_count = retained_token_count - emitted_token_count
+        if len(status.pending_logprobs) > allowed_pending_count:
+            status.pending_logprobs = status.pending_logprobs[:allowed_pending_count]
+
+        accounted_token_count = emitted_token_count + len(status.pending_logprobs)
+        new_retained_token_count = retained_token_count - accounted_token_count
+        if new_retained_token_count == 0:
+            return
+        if output_ids is None or new_retained_token_count > output_ids.numel():
+            raise RuntimeError(
+                "retained logprob token count does not align with the output chunk"
+            )
+
+        current_records = self._generate_log_probs_from_tensors(
+            status.request,
+            output_ids,
+            token_logprobs,
+            top_logprob_token_ids,
+            top_logprobs,
+            new_retained_token_count,
+        )
+        if current_records:
+            status.pending_logprobs.extend(current_records)
+
+    def _trim_pending_logprobs_to_visible_text(
+        self,
+        status: Union[StreamStatus, StreamStatusSync],
+        visible_delta: str,
+    ) -> None:
+        """Drop pending records that do not contribute to the visible delta.
+
+        Token-level stop words are already removed from ``status.output_ids``.
+        This extra pass covers both a stop string found by the decoded-text path
+        and an incomplete UTF-8 suffix discarded when generation terminates.
+        """
+        if not status.pending_logprobs:
+            return
+
+        if not visible_delta:
+            status.pending_logprobs = []
+            return
+
+        output_ids = list(status.output_ids)
+        context_count = status.emitted_logprob_token_count
+        pending_count = len(status.pending_logprobs)
+        if context_count + pending_count > len(output_ids):
+            return
+
+        context_ids = output_ids[:context_count]
+        pending_ids = output_ids[context_count : context_count + pending_count]
+        context_text = self.tokenizer.decode(context_ids)
+        found_context_preserving_prefix = False
+        keep_count = 0
+        for index in range(1, pending_count + 1):
+            candidate_text = self.tokenizer.decode(context_ids + pending_ids[:index])
+            if not candidate_text.startswith(context_text):
+                continue
+            found_context_preserving_prefix = True
+            candidate_delta = candidate_text[len(context_text) :]
+            if candidate_delta == visible_delta or candidate_delta.startswith(
+                visible_delta
+            ):
+                # The first matching prefix is the smallest token set that
+                # accounts for all visible text.  ``candidate_delta`` may be
+                # longer when the truncated UTF-8/stop suffix shares its final
+                # token with visible text; that token's logprob must remain.
+                keep_count = index
+                break
+            if visible_delta.startswith(candidate_delta):
+                # This prefix is wholly visible, but later tokens may still be
+                # required (for example byte-fallback pieces that only decode
+                # after the following token arrives).
+                keep_count = index
+
+        # Some context-sensitive tokenizers do not preserve the decoded prefix.
+        # In that case, do not guess away valid records. If decoding was stable
+        # but no pending prefix is visible, every pending record belongs to the
+        # truncated suffix.
+        if found_context_preserving_prefix:
+            status.pending_logprobs = status.pending_logprobs[:keep_count]
+
+    @staticmethod
+    def _prepare_decoded_string_for_emit(
+        status: Union[StreamStatus, StreamStatusSync],
+        decoded_string: str,
+        is_streaming: bool,
+    ) -> Tuple[Optional[str], bool]:
+        """Handle an incomplete decoded UTF-8 suffix before emitting a chunk.
+
+        Without logprobs, preserve the renderer's historical behavior: streaming
+        waits for a trailing replacement character, while non-streaming removes
+        it and emits the valid prefix.  With logprobs, tokens must stay pending
+        until they either become decodable or generation ends.  At termination,
+        emit the valid prefix and report that the invisible suffix was removed so
+        its pending logprob records can be trimmed as well.
+
+        Returns ``(None, False)`` when the caller should keep buffering.  The
+        boolean is true only when a terminal invisible suffix was removed.
+        """
+        if not status.request.logprobs:
+            if is_streaming and decoded_string.endswith("\ufffd"):
+                return None, False
+            if not is_streaming:
+                decoded_string = decoded_string.rstrip("\ufffd")
+            return decoded_string, False
+
+        has_uncommitted_tokens = len(status.output_ids) > len(status.last_output_ids)
+        if not has_uncommitted_tokens:
+            return decoded_string, False
+
+        has_incomplete_suffix = not decoded_string or decoded_string.endswith("\ufffd")
+        if not has_incomplete_suffix:
+            return decoded_string, False
+        if status.finish_reason is None:
+            return None, False
+        return decoded_string.rstrip("\ufffd"), True
+
+    @staticmethod
+    def _take_pending_logprobs(
+        status: Union[StreamStatus, StreamStatusSync],
+    ) -> Optional[List[ChatCompletionTokenLogprob]]:
+        if not status.pending_logprobs:
+            return None
+        result = status.pending_logprobs
+        status.pending_logprobs = []
+        status.emitted_logprob_token_count += len(result)
+        return result
+
+    async def _generate_log_probs(
+        self,
+        status: StreamStatus,
+        output: Optional[GenerateOutput],
+        token_count: Optional[int] = None,
+    ) -> Optional[List[ChatCompletionTokenLogprob]]:
+        assert output is not None
+        return self._generate_log_probs_from_tensors(
+            status.request,
+            output.output_ids,
+            output.token_logprobs,
+            output.top_logprob_token_ids,
+            output.top_logprobs,
+            token_count,
+        )
 
     async def _generate_extra_outputs(
         self, output: GenerateOutput, generate_config: GenerateConfig
@@ -832,35 +1122,48 @@ class CustomChatRenderer:
             functools.partial(self._check_finish_reason, max_new_tokens=max_new_tokens),
             self._remove_stop_word_ids,
         )
+        self._accumulate_log_probs_from_tensors(
+            status,
+            output.output_ids,
+            output.token_logprobs,
+            output.top_logprob_token_ids,
+            output.top_logprobs,
+        )
         decoded_prev_token = self.tokenizer.decode(status.prev_token_id)
         decoded_string = self.tokenizer.decode(status.tokens_to_decode)
-        # For some tokenizers (e.g. ChatGLM), decode a single token differs from decode a list of tokens.
-        if is_streaming:
-            if len(decoded_string) > 0 and "\ufffd" == decoded_string[-1]:
-                return await self._create_empty_delta(output.aux_info)
-        else:
-            while (len(decoded_string) > 0) and ("\ufffd" == decoded_string[-1]):
-                decoded_string = decoded_string[:-1]
+        decoded_string, trimmed_incomplete_utf8 = self._prepare_decoded_string_for_emit(
+            status, decoded_string, is_streaming
+        )
+        if decoded_string is None:
+            return await self._create_empty_delta(output.aux_info)
         status.delta_output_string = decoded_string[len(decoded_prev_token) :]
 
         # Process stop words: truncate complete stop words, detect partial stop words
+        untruncated_delta = status.delta_output_string
         status.delta_output_string, should_buffer = self._process_stop_words(
-            status.delta_output_string,
+            untruncated_delta,
             stop_words_str,
             stop_word_slice_list,
             is_streaming,
             status,
         )
+        if trimmed_incomplete_utf8 or len(status.delta_output_string) < len(
+            untruncated_delta
+        ):
+            self._trim_pending_logprobs_to_visible_text(
+                status, status.delta_output_string
+            )
 
         if should_buffer:
             return await self._create_empty_delta(output.aux_info)
 
         # Build delta output
         if len(status.delta_output_string) > 0:
+            current_logprobs = self._take_pending_logprobs(status)
             status.update_result()
             delta = OutputDelta(
                 output_str=status.delta_output_string,
-                logprobs=await self._generate_log_probs(status, output),
+                logprobs=current_logprobs,
                 input_length=output.aux_info.input_len,
                 output_length=output.aux_info.output_len,
                 reuse_length=output.aux_info.reuse_len,
@@ -868,7 +1171,10 @@ class CustomChatRenderer:
             status.delta_output_string = ""
             return delta
         else:
-            return await self._create_empty_delta(output.aux_info)
+            current_logprobs = self._take_pending_logprobs(status)
+            if current_logprobs:
+                status.update_result()
+            return await self._create_empty_delta(output.aux_info, current_logprobs)
 
     async def _generate_first(self, n: int):
         return StreamResponseObject(
@@ -974,7 +1280,7 @@ class CustomChatRenderer:
                     delta=delta,
                     logprobs=(
                         ChoiceLogprobs(
-                            content=[item.logprobs] if item.logprobs != None else None,
+                            content=item.logprobs,
                             refusal=None,
                         )
                         if item.logprobs != None
@@ -1031,7 +1337,7 @@ class CustomChatRenderer:
             output_items.append(
                 OutputDelta(
                     trunc_string,
-                    await self._generate_log_probs(buffer, buffer.output),
+                    self._take_pending_logprobs(buffer),
                     aux_info.input_len,
                     aux_info.output_len,
                     aux_info.reuse_len,
@@ -1191,10 +1497,16 @@ class CustomChatRenderer:
             if self._should_yield_stream_response(final_response, is_final=True):
                 yield final_response
 
-    def _create_empty_delta_sync(self, input_len: int, output_len: int, reuse_len: int):
+    def _create_empty_delta_sync(
+        self,
+        input_len: int,
+        output_len: int,
+        reuse_len: int,
+        logprobs: Optional[List[ChatCompletionTokenLogprob]] = None,
+    ):
         return OutputDelta(
             output_str="",
-            logprobs=None,
+            logprobs=logprobs,
             input_length=input_len,
             output_length=output_len,
             reuse_length=reuse_len,
@@ -1203,50 +1515,20 @@ class CustomChatRenderer:
     def _generate_log_probs_sync(
         self,
         status: StreamStatusSync,
-        all_probs: Optional[torch.Tensor],
+        token_logprobs: Optional[torch.Tensor],
+        top_logprob_token_ids: Optional[torch.Tensor],
+        top_logprobs: Optional[torch.Tensor],
         output_ids: Optional[torch.Tensor],
-    ) -> Optional[ChatCompletionTokenLogprob]:
-        if not status.request.logprobs:
-            return None
-        prob_return_num = status.request.top_logprobs or 1
-        all_probs = all_probs
-        output_id = output_ids
-        if output_id == None:
-            return None
-        selected_id = output_id[-1].item()
-        if all_probs == None:
-            raise Exception(
-                "all_probs is None when logprobs is true. There should be a internal bug."
-            )
-        all_probs = all_probs.squeeze()
-        non_zero_size = all_probs.nonzero().shape[0]
-        prob_return_num = min(prob_return_num, non_zero_size)
-        # 使用 topk 提高计算效率，只计算需要的前 k 个值
-        probs, tokens = all_probs.topk(
-            prob_return_num, dim=-1, largest=True, sorted=True
+        token_count: Optional[int] = None,
+    ) -> Optional[List[ChatCompletionTokenLogprob]]:
+        return self._generate_log_probs_from_tensors(
+            status.request,
+            output_ids,
+            token_logprobs,
+            top_logprob_token_ids,
+            top_logprobs,
+            token_count,
         )
-        log_values = probs.log()
-
-        selected_token = self.tokenizer.decode([selected_id])
-        chat_logprob = ChatCompletionTokenLogprob(
-            token=selected_token,
-            bytes=list(selected_token.encode("utf-8", errors="replace")),
-            logprob=all_probs[output_id].log().item(),
-            top_logprobs=[],
-        )
-        for i in range(prob_return_num):
-            token = self.tokenizer.decode(tokens[i].item())
-            chat_logprob.top_logprobs.append(
-                TopLogprob(
-                    token=token,
-                    logprob=log_values[i].item(),
-                    bytes=list(token.encode("utf-8", errors="replace")),
-                )
-            )
-
-        logging.debug("chat_logprob: %s", chat_logprob.model_dump_json(indent=4))
-
-        return chat_logprob
 
     def _update_single_status_sync(
         self,
@@ -1254,7 +1536,9 @@ class CustomChatRenderer:
         input_len: int,  # output.aux_info
         output_len: int,  # output.aux_info
         reuse_len: int,  # output.aux_info
-        all_probs: torch.Tensor,
+        token_logprobs: torch.Tensor,
+        top_logprob_token_ids: torch.Tensor,
+        top_logprobs: torch.Tensor,
         output_ids: torch.Tensor,
         max_new_tokens: int,
         stop_words_str: List[str],
@@ -1269,35 +1553,48 @@ class CustomChatRenderer:
             functools.partial(self._check_finish_reason, max_new_tokens=max_new_tokens),
             self._remove_stop_word_ids,
         )
+        self._accumulate_log_probs_from_tensors(
+            status,
+            output_ids,
+            token_logprobs,
+            top_logprob_token_ids,
+            top_logprobs,
+        )
         decoded_prev_token = self.tokenizer.decode(status.prev_token_id)
         decoded_string = self.tokenizer.decode(status.tokens_to_decode)
-        # For some tokenizers (e.g. ChatGLM), decode a single token differs from decode a list of tokens.
-        if is_streaming:
-            if len(decoded_string) > 0 and "\ufffd" == decoded_string[-1]:
-                return self._create_empty_delta_sync(input_len, output_len, reuse_len)
-        else:
-            while (len(decoded_string) > 0) and ("\ufffd" == decoded_string[-1]):
-                decoded_string = decoded_string[:-1]
+        decoded_string, trimmed_incomplete_utf8 = self._prepare_decoded_string_for_emit(
+            status, decoded_string, is_streaming
+        )
+        if decoded_string is None:
+            return self._create_empty_delta_sync(input_len, output_len, reuse_len)
         status.delta_output_string = decoded_string[len(decoded_prev_token) :]
 
         # Process stop words: truncate complete stop words, detect partial stop words
+        untruncated_delta = status.delta_output_string
         status.delta_output_string, should_buffer = self._process_stop_words(
-            status.delta_output_string,
+            untruncated_delta,
             stop_words_str,
             stop_word_slice_list,
             is_streaming,
             status,
         )
+        if trimmed_incomplete_utf8 or len(status.delta_output_string) < len(
+            untruncated_delta
+        ):
+            self._trim_pending_logprobs_to_visible_text(
+                status, status.delta_output_string
+            )
 
         if should_buffer:
             return self._create_empty_delta_sync(input_len, output_len, reuse_len)
 
         # Build delta output
         if len(status.delta_output_string) > 0:
+            current_logprobs = self._take_pending_logprobs(status)
             status.update_result()
             delta = OutputDelta(
                 output_str=status.delta_output_string,
-                logprobs=self._generate_log_probs_sync(status, all_probs, output_ids),
+                logprobs=current_logprobs,
                 input_length=input_len,
                 output_length=output_len,
                 reuse_length=reuse_len,
@@ -1305,7 +1602,12 @@ class CustomChatRenderer:
             status.delta_output_string = ""
             return delta
         else:
-            return self._create_empty_delta_sync(input_len, output_len, reuse_len)
+            current_logprobs = self._take_pending_logprobs(status)
+            if current_logprobs:
+                status.update_result()
+            return self._create_empty_delta_sync(
+                input_len, output_len, reuse_len, current_logprobs
+            )
 
     def _generate_first_sync(self, n: int):
         return StreamResponseObject(
@@ -1342,7 +1644,7 @@ class CustomChatRenderer:
                     ),
                     logprobs=(
                         ChoiceLogprobs(
-                            content=[item.logprobs] if item.logprobs != None else None,
+                            content=item.logprobs,
                             refusal=None,
                         )
                         if item.logprobs != None
@@ -1369,19 +1671,19 @@ class CustomChatRenderer:
         input_len_list,
         output_len_list,
         reuse_len_list,
-        all_probs_list,
+        token_logprobs_list,
+        top_logprob_token_ids_list,
+        top_logprobs_list,
         output_ids_list,
         stop_words_str: List[str],
         is_streaming: bool,
     ):
         output_items: List[OutputDelta] = []
-        for buffer, input_len, output_len, reuse_len, all_probs, output_ids in zip(
+        for buffer, input_len, output_len, reuse_len in zip(
             buffer_list,
             input_len_list,
             output_len_list,
             reuse_len_list,
-            all_probs_list,
-            output_ids_list,
         ):
             trunc_string = truncate_response_with_stop_words(
                 buffer.delta_output_string, stop_words_str, is_streaming
@@ -1389,7 +1691,7 @@ class CustomChatRenderer:
             output_items.append(
                 OutputDelta(
                     trunc_string,
-                    self._generate_log_probs_sync(buffer, all_probs, output_ids),
+                    self._take_pending_logprobs(buffer),
                     input_len,
                     output_len,
                     reuse_len,
@@ -1462,7 +1764,9 @@ class CustomChatRenderer:
         input_len_list,  # output.aux_info
         output_len_list,  # output.aux_info
         reuse_len_list,  # output.aux_info
-        all_probs_list,  # GenerateOutput
+        token_logprobs_list,  # GenerateOutput
+        top_logprob_token_ids_list,  # GenerateOutput
+        top_logprobs_list,  # GenerateOutput
         output_ids_list,  # GenerateOutput
         max_new_tokens,  # GenerateConfig
         stop_words_str,  # GenerateConfig
@@ -1472,12 +1776,23 @@ class CustomChatRenderer:
             stop_words_str
         )  # move into cpp, then pass in
         delta_list: List[OutputDelta] = []
-        for status, input_len, output_len, reuse_len, all_probs, output_ids in zip(
+        for (
+            status,
+            input_len,
+            output_len,
+            reuse_len,
+            token_logprobs,
+            top_logprob_token_ids,
+            top_logprobs,
+            output_ids,
+        ) in zip(
             status_list,
             input_len_list,
             output_len_list,
             reuse_len_list,  # AuxInfo
-            all_probs_list,
+            token_logprobs_list,
+            top_logprob_token_ids_list,
+            top_logprobs_list,
             output_ids_list,  # GenerateOutput
         ):
             delta_list.append(
@@ -1486,7 +1801,9 @@ class CustomChatRenderer:
                     input_len,
                     output_len,
                     reuse_len,
-                    all_probs,
+                    token_logprobs,
+                    top_logprob_token_ids,
+                    top_logprobs,
                     output_ids,
                     max_new_tokens,
                     stop_words_str,
@@ -1508,7 +1825,9 @@ class CustomChatRenderer:
         input_len_list,
         output_len_list,
         reuse_len_list,
-        all_probs_list,
+        token_logprobs_list,
+        top_logprob_token_ids_list,
+        top_logprobs_list,
         output_ids_list,
         stop_words_str,
         is_streaming,
@@ -1518,7 +1837,9 @@ class CustomChatRenderer:
             input_len_list,
             output_len_list,
             reuse_len_list,
-            all_probs_list,
+            token_logprobs_list,
+            top_logprob_token_ids_list,
+            top_logprobs_list,
             output_ids_list,
             stop_words_str,
             is_streaming,
@@ -1553,7 +1874,9 @@ class CustomChatRenderer:
         input_len_list,  # output.aux_info
         output_len_list,  # output.aux_info
         reuse_len_list,  # output.aux_info
-        all_probs_list,  # GenerateOutput
+        token_logprobs_list,  # GenerateOutput
+        top_logprob_token_ids_list,  # GenerateOutput
+        top_logprobs_list,  # GenerateOutput
         output_ids_list,  # GenerateOutput
         max_new_tokens,  # GenerateConfig
         stop_words_str,  # GenerateConfig
@@ -1563,12 +1886,23 @@ class CustomChatRenderer:
             stop_words_str
         )  # move into cpp, then pass in
         delta_list: List[OutputDelta] = []
-        for status, input_len, output_len, reuse_len, all_probs, output_ids in zip(
+        for (
+            status,
+            input_len,
+            output_len,
+            reuse_len,
+            token_logprobs,
+            top_logprob_token_ids,
+            top_logprobs,
+            output_ids,
+        ) in zip(
             status_list,
             input_len_list,
             output_len_list,
             reuse_len_list,  # AuxInfo
-            all_probs_list,
+            token_logprobs_list,
+            top_logprob_token_ids_list,
+            top_logprobs_list,
             output_ids_list,  # GenerateOutput
         ):
             delta_list.append(
@@ -1577,7 +1911,9 @@ class CustomChatRenderer:
                     input_len,
                     output_len,
                     reuse_len,
-                    all_probs,
+                    token_logprobs,
+                    top_logprob_token_ids,
+                    top_logprobs,
                     output_ids,
                     max_new_tokens,
                     stop_words_str,
@@ -1594,7 +1930,9 @@ class CustomChatRenderer:
         input_len_list,
         output_len_list,
         reuse_len_list,
-        all_probs_list,
+        token_logprobs_list,
+        top_logprob_token_ids_list,
+        top_logprobs_list,
         output_ids_list,
         stop_words_str,
         is_streaming,
@@ -1604,7 +1942,9 @@ class CustomChatRenderer:
             input_len_list,
             output_len_list,
             reuse_len_list,
-            all_probs_list,
+            token_logprobs_list,
+            top_logprob_token_ids_list,
+            top_logprobs_list,
             output_ids_list,
             stop_words_str,
             is_streaming,
