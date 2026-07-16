@@ -37,15 +37,15 @@ class TorchMegaNVFP4InputPacker(MegaNVFP4InputPacker):
             )
         from deep_gemm.utils import per_token_cast_to_nvfp4
 
-        x_fp4, x_sf, x_scale_2 = per_token_cast_to_nvfp4(
+        x_fp4, x_sf, x_gsf = per_token_cast_to_nvfp4(
             x.contiguous(),
             gran_k=16,
             use_packed_ue4m3=True,
-            return_global_scale=True,
+            return_gsf=True,
         )
         buf.x[:tokens].copy_(x_fp4)
         buf.x_sf[:tokens].copy_(x_sf)
-        buf.x_scale_2[:tokens].copy_(x_scale_2)
+        buf.x_gsf[:tokens].copy_(x_gsf)
         buf.topk_idx[:tokens].copy_(indices.to(torch.int64).contiguous())
         buf.topk_weights[:tokens].copy_(weights.to(torch.float32).contiguous())
 
@@ -68,7 +68,7 @@ class FusedMegaNVFP4InputPacker(MegaNVFP4InputPacker):
             indices,
             buf.x[:tokens],
             buf.x_sf[:tokens],
-            buf.x_scale_2[:tokens],
+            buf.x_gsf[:tokens],
             buf.topk_idx[:tokens],
             buf.topk_weights[:tokens],
         )

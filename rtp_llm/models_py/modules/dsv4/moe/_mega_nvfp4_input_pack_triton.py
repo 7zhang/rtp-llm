@@ -56,9 +56,9 @@ if triton is not None:
         return code | (sign.to(tl.int32) << 3)
 
     @triton.jit(do_not_specialize=["M"])
-    def _row_global_scale_kernel(
+    def _row_gsf_kernel(
         x_ptr,
-        out_scale_ptr,
+        out_gsf_ptr,
         M,
         D: tl.constexpr,
         x_stride_m: tl.constexpr,
@@ -73,7 +73,7 @@ if triton is not None:
         row_amax = tl.maximum(tl.max(tl.abs(values), axis=0), 1.0e-30)
         # Match PyTorch's constant-division lowering in the DeepGEMM reference;
         # forcing div.rn here differs by one ULP for some BF16 row maxima.
-        tl.store(out_scale_ptr + row, row_amax / (6.0 * 448.0), mask=row < M)
+        tl.store(out_gsf_ptr + row, row_amax / (6.0 * 448.0), mask=row < M)
 
     @triton.jit(do_not_specialize=["M"])
     def _pack_nvfp4_inputs_kernel(
@@ -82,7 +82,7 @@ if triton is not None:
         indices_ptr,
         out_fp4_ptr,
         out_sf_ptr,
-        out_scale_ptr,
+        out_gsf_ptr,
         out_indices_ptr,
         out_weights_ptr,
         M,
@@ -102,7 +102,7 @@ if triton is not None:
         dim_block = tl.program_id(1)
         rows = row_block * BLOCK_M + tl.arange(0, BLOCK_M).to(tl.int64)
         row_mask = rows < M
-        global_scale = tl.load(out_scale_ptr + rows, mask=row_mask, other=1.0)
+        gsf = tl.load(out_gsf_ptr + rows, mask=row_mask, other=1.0)
         packed_sf = tl.zeros((BLOCK_M,), dtype=tl.int32)
 
         for scale_group in tl.static_range(4):
@@ -114,9 +114,9 @@ if triton is not None:
                 other=0.0,
             ).to(tl.float32)
             group_amax = tl.maximum(tl.max(tl.abs(group_values), axis=1), 1.0e-4)
-            sf_code, sf_value = _ceil_ue4m3(tl.div_rn(group_amax, 6.0 * global_scale))
+            sf_code, sf_value = _ceil_ue4m3(tl.div_rn(group_amax, 6.0 * gsf))
             packed_sf = packed_sf | (sf_code << (scale_group * 8))
-            denominator = sf_value * global_scale
+            denominator = sf_value * gsf
 
             for pair in tl.static_range(8):
                 col0 = dim_block * 64 + scale_group * 16 + pair * 2
@@ -182,7 +182,7 @@ def _validate_inputs(
     indices: torch.Tensor,
     out_fp4: torch.Tensor,
     out_sf: torch.Tensor,
-    out_scale: torch.Tensor,
+    out_gsf: torch.Tensor,
 ) -> tuple[int, int, int]:
     if triton is None:
         raise RuntimeError("triton is unavailable")
@@ -199,8 +199,11 @@ def _validate_inputs(
         raise ValueError(f"out_fp4 shape mismatch: {tuple(out_fp4.shape)}")
     if out_sf.shape != (tokens, hidden // 64):
         raise ValueError(f"out_sf shape mismatch: {tuple(out_sf.shape)}")
-    if out_scale.shape != (tokens,):
-        raise ValueError(f"out_scale shape mismatch: {tuple(out_scale.shape)}")
+    if out_gsf.dtype != torch.float32 or out_gsf.shape != (tokens,):
+        raise ValueError(
+            "out_gsf must be float32 [T], got "
+            f"dtype={out_gsf.dtype}, shape={tuple(out_gsf.shape)}"
+        )
     return tokens, hidden, weights.size(1)
 
 
@@ -210,12 +213,12 @@ def fused_pack_mega_nvfp4_inputs(
     indices: torch.Tensor,
     out_fp4: torch.Tensor,
     out_sf: torch.Tensor,
-    out_scale: torch.Tensor,
+    out_gsf: torch.Tensor,
     out_indices: torch.Tensor,
     out_weights: torch.Tensor,
 ) -> None:
     tokens, hidden, topk = _validate_inputs(
-        x, weights, indices, out_fp4, out_sf, out_scale
+        x, weights, indices, out_fp4, out_sf, out_gsf
     )
     if tokens == 0:
         return
@@ -223,9 +226,9 @@ def fused_pack_mega_nvfp4_inputs(
     if block_m not in (1, 2, 4, 8):
         raise ValueError("DSV4_MEGA_MOE_NVFP4_PACK_BLOCK_M must be one of 1,2,4,8")
     block_topk = triton.next_power_of_2(topk)
-    _row_global_scale_kernel[(tokens,)](
+    _row_gsf_kernel[(tokens,)](
         x,
-        out_scale,
+        out_gsf,
         tokens,
         hidden,
         x.stride(0),
@@ -239,7 +242,7 @@ def fused_pack_mega_nvfp4_inputs(
         indices,
         out_fp4,
         out_sf,
-        out_scale,
+        out_gsf,
         out_indices,
         out_weights,
         tokens,

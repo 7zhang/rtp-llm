@@ -27,7 +27,7 @@ class MegaNVFP4InputPackerTest(unittest.TestCase):
             ).contiguous()
             out_x = torch.empty((tokens, 2048), device="cuda", dtype=torch.int8)
             out_sf = torch.empty((tokens, 64), device="cuda", dtype=torch.int32)
-            out_scale = torch.empty((tokens,), device="cuda", dtype=torch.float32)
+            out_gsf = torch.empty((tokens,), device="cuda", dtype=torch.float32)
             out_indices = torch.empty_like(indices)
             out_weights = torch.empty_like(weights)
 
@@ -37,18 +37,19 @@ class MegaNVFP4InputPackerTest(unittest.TestCase):
                 indices,
                 out_x,
                 out_sf,
-                out_scale,
+                out_gsf,
                 out_indices,
                 out_weights,
             )
-            ref_x, ref_sf, ref_scale = per_token_cast_to_nvfp4(
+            ref_x, ref_sf, ref_gsf = per_token_cast_to_nvfp4(
                 x,
                 gran_k=16,
                 use_packed_ue4m3=True,
-                return_global_scale=True,
+                return_gsf=True,
             )
             self.assertTrue(torch.equal(out_x, ref_x))
             self.assertTrue(torch.equal(out_sf, ref_sf))
-            self.assertTrue(torch.equal(out_scale, ref_scale))
+            self.assertEqual(out_gsf.dtype, torch.float32)
+            self.assertTrue(torch.equal(out_gsf, ref_gsf))
             self.assertTrue(torch.equal(out_indices, indices))
             self.assertTrue(torch.equal(out_weights, weights))
