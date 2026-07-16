@@ -151,8 +151,10 @@ absl::StatusOr<SamplerInputs> MtpBatchStreamProcessor::gatherSpecSamplerInput(
 
     sampler_inputs.logits = model_output.logits.clone();
     if (spec_logits_result.has_active_processor) {
-        SpecLogitsVerifyRunner::applyMaskToLogits(
-            sampler_inputs.logits, spec_logits_result.spec_vocab_mask_gpu, sampler_inputs.vocab_size);
+        SpecLogitsVerifyRunner::applyMaskToLogits(sampler_inputs.logits,
+                                                  spec_logits_result.packed_allow_mask_gpu,
+                                                  spec_logits_result.logits_row_indices_gpu,
+                                                  sampler_inputs.vocab_size);
     }
 
     RTP_LLM_LOG_DEBUG("sampler inputs logits [%s]",

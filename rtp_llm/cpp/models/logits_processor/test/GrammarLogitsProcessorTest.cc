@@ -1,4 +1,4 @@
-// CPU unit tests for GrammarLogitsProcessor over a 128-char ASCII vocab.
+// Unit tests for GrammarLogitsProcessor over a 128-char ASCII vocab.
 
 #include "rtp_llm/cpp/models/logits_processor/GrammarLogitsProcessor.h"
 #include "rtp_llm/cpp/engine_base/grammar/RtpGrammarMatcher.h"
@@ -88,7 +88,7 @@ SamplerInputs makeSamplerInputs(torch::Tensor logits) {
 }
 
 std::vector<float> logitsVec(const torch::Tensor& logits) {
-    auto cpu = logits.cpu().contiguous();
+    auto cpu = logits.to(torch::kFloat32).cpu().contiguous();
     return std::vector<float>(cpu.data_ptr<float>(), cpu.data_ptr<float>() + cpu.numel());
 }
 
@@ -127,6 +127,10 @@ std::string makeReasoningStructuralTagWithTokenEnd(int budget, int end_token_id)
            + R"(}},{"type":"regex","pattern":"a"}]}})";
 }
 
+std::string makeUnboundedAnyTextStructuralTag() {
+    return R"({"type":"structural_tag","format":{"type":"any_text"}})";
+}
+
 constexpr int kA   = 'a';  // token id 97
 constexpr int kB   = 'b';  // token id 98
 constexpr int kC   = 'c';  // token id 99
@@ -148,7 +152,7 @@ TEST(GrammarLogitsProcessorTest, ProcessMasksInitialDecodeState) {
 
     auto logits = torch::zeros({1, 128}, torch::kFloat32);
     auto inputs = makeSamplerInputs(logits);
-    auto error = proc->process(inputs, 0, 1);
+    auto error  = proc->process(inputs, 0, 1);
 
     auto values = logitsVec(logits);
     expectTokenAllowed(values, kA);
@@ -157,17 +161,78 @@ TEST(GrammarLogitsProcessorTest, ProcessMasksInitialDecodeState) {
     EXPECT_FALSE(error.has_value());
 }
 
+TEST(GrammarLogitsProcessorTest, ProcessAppliesPackedMaskOnGpuAcrossLogitDtypes) {
+    XGrammarBackend backend(makeAsciiTokenizerInfo(), defaultOptions());
+
+    for (const auto dtype : {torch::kFloat32, torch::kFloat16, torch::kBFloat16}) {
+        auto proc   = makeProcessor(backend, "ab");
+        auto logits = torch::zeros({1, 128}, torch::TensorOptions().dtype(dtype).device(torch::kCUDA));
+        auto inputs = makeSamplerInputs(logits);
+
+        ASSERT_FALSE(proc->process(inputs, 0, 1).has_value());
+        auto values = logitsVec(logits);
+        expectTokenAllowed(values, kA);
+        expectTokenMasked(values, kB);
+        expectTokenMasked(values, kX);
+    }
+}
+
+TEST(GrammarLogitsProcessorTest, ProcessKeepsReasoningFreeUntilBudgetThenAppliesFinalGrammarOnGpu) {
+    XGrammarBackend backend(makeAsciiTokenizerInfo(), defaultOptions());
+    auto            proc = makeProcessorFromKey(backend, {"structural_tag", makeReasoningStructuralTag(/*budget=*/1)});
+
+    auto reasoning_logits = torch::zeros({1, 128}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    ASSERT_FALSE(proc->process(makeSamplerInputs(reasoning_logits), 0, 1).has_value());
+    expectTokenAllowed(logitsVec(reasoning_logits), kX);
+
+    ASSERT_FALSE(proc->updateStatus(torch::tensor({kX}, torch::kInt32).reshape({1, 1}), 1).has_value());
+    auto end_logits = torch::zeros({1, 128}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    ASSERT_FALSE(proc->process(makeSamplerInputs(end_logits), 0, 1).has_value());
+    auto end_values = logitsVec(end_logits);
+    expectTokenAllowed(end_values, kZ);
+    expectTokenMasked(end_values, kX);
+    expectTokenMasked(end_values, kA);
+
+    ASSERT_FALSE(proc->updateStatus(torch::tensor({kZ}, torch::kInt32).reshape({1, 1}), 1).has_value());
+    auto final_logits = torch::zeros({1, 128}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    ASSERT_FALSE(proc->process(makeSamplerInputs(final_logits), 0, 1).has_value());
+    auto final_values = logitsVec(final_logits);
+    expectTokenAllowed(final_values, kA);
+    expectTokenMasked(final_values, kB);
+}
+
+TEST(GrammarLogitsProcessorTest, AllTrueXGrammarMaskIsANoopRatherThanFailure) {
+    XGrammarBackend backend(makeAsciiTokenizerInfo(), defaultOptions());
+    auto            proc = makeProcessorFromKey(backend,
+                                                {"structural_tag", makeUnboundedAnyTextStructuralTag()},
+                                     /*terminate_without_stop_token=*/false);
+
+    const size_t         words = SpecLogitsProcessor::bitmaskWordCount(128);
+    std::vector<int32_t> bitmask(words, SpecLogitsProcessor::kBitmaskAllowAll);
+    int64_t              dl_shape[2];
+    DLTensor             dl     = makeSingleRowBitmaskView(bitmask.data(), static_cast<int32_t>(words), dl_shape);
+    auto                 filled = proc.matcher->fillBitmask(&dl, 0);
+    ASSERT_TRUE(filled.ok()) << filled.status().ToString();
+    ASSERT_FALSE(filled.value()) << "unbounded any_text should produce an all-true mask";
+
+    auto logits = torch::zeros({1, 128}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    ASSERT_FALSE(proc->process(makeSamplerInputs(logits), 0, 1).has_value());
+    auto values = logitsVec(logits);
+    expectTokenAllowed(values, kA);
+    expectTokenAllowed(values, kX);
+    expectTokenAllowed(values, kEos);
+}
+
 TEST(GrammarLogitsProcessorTest, ReplayModeRebuildsIndependentBeamStates) {
     XGrammarBackend backend(makeAsciiTokenizerInfo(), defaultOptions());
     auto            template_proc = makeProcessor(backend, "ab|cd");
-    auto replay_proc =
-        std::make_shared<GrammarLogitsProcessor>(template_proc.matcher, kEos, /*replay_each_step=*/true);
+    auto replay_proc = std::make_shared<GrammarLogitsProcessor>(template_proc.matcher, kEos, /*replay_each_step=*/true);
 
     auto inputs = makeSamplerInputs(torch::zeros({2, 128}, torch::kFloat32));
     // Prompt tokens intentionally differ and are ignored. The output prefixes
     // select different parser branches for the two beams.
-    inputs.token_ids = torch::tensor({{17, kA, 0}, {23, kC, 0}}, torch::kInt32).contiguous();
-    inputs.input_lengths = torch::tensor({1, 1}, torch::kInt32);
+    inputs.token_ids        = torch::tensor({{17, kA, 0}, {23, kC, 0}}, torch::kInt32).contiguous();
+    inputs.input_lengths    = torch::tensor({1, 1}, torch::kInt32);
     inputs.sequence_lengths = torch::tensor({2, 2}, torch::kInt32);
 
     auto error = replay_proc->process(inputs, 0, 2);
@@ -182,17 +247,45 @@ TEST(GrammarLogitsProcessorTest, ReplayModeRebuildsIndependentBeamStates) {
     expectTokenAllowed(beam_c, kD);
 }
 
+TEST(GrammarLogitsProcessorTest, ReplayModeMasksEachBeamAgainstJsonSchema) {
+    XGrammarBackend   backend(makeAsciiTokenizerInfo(), defaultOptions());
+    const std::string schema =
+        R"({"type":"object","properties":{"x":{"type":"string","enum":["ab","cd"]}},"required":["x"],"additionalProperties":false})";
+    auto template_proc = makeProcessorFromKey(backend, {"json", schema});
+    auto replay_proc = std::make_shared<GrammarLogitsProcessor>(template_proc.matcher, kEos, /*replay_each_step=*/true);
+
+    auto inputs = makeSamplerInputs(torch::zeros({2, 128}, torch::kFloat32));
+    // The two JSON prefixes have selected different enum values. Replaying
+    // each row must allow b only after "a" and d only after "c".
+    inputs.token_ids =
+        torch::tensor({{17, '{', '"', 'x', '"', ':', '"', kA, 0}, {23, '{', '"', 'x', '"', ':', '"', kC, 0}},
+                      torch::kInt32)
+            .contiguous();
+    inputs.input_lengths    = torch::tensor({1, 1}, torch::kInt32);
+    inputs.sequence_lengths = torch::tensor({8, 8}, torch::kInt32);
+
+    ASSERT_FALSE(replay_proc->process(inputs, 0, 2).has_value());
+
+    auto beam_a = logitsVec(inputs.logits[0]);
+    expectTokenAllowed(beam_a, kB);
+    expectTokenMasked(beam_a, kD);
+
+    auto beam_c = logitsVec(inputs.logits[1]);
+    expectTokenMasked(beam_c, kB);
+    expectTokenAllowed(beam_c, kD);
+}
+
 TEST(GrammarLogitsProcessorTest, UpdateStatusAdvancesDecodeMaskState) {
     XGrammarBackend backend(makeAsciiTokenizerInfo(), defaultOptions());
     auto            proc = makeProcessor(backend, "ab");
 
-    auto token_a = torch::tensor({kA}, torch::kInt32).reshape({1, 1});
+    auto token_a      = torch::tensor({kA}, torch::kInt32).reshape({1, 1});
     auto update_error = proc->updateStatus(token_a, 1);
     EXPECT_EQ(proc->committedOutputLen(), 1);
     ASSERT_FALSE(update_error.has_value());
 
-    auto logits = torch::zeros({1, 128}, torch::kFloat32);
-    auto inputs = makeSamplerInputs(logits);
+    auto logits        = torch::zeros({1, 128}, torch::kFloat32);
+    auto inputs        = makeSamplerInputs(logits);
     auto process_error = proc->process(inputs, 0, 1);
     ASSERT_FALSE(process_error.has_value());
 
@@ -211,8 +304,8 @@ TEST(GrammarLogitsProcessorTest, ProcessForcesEosAfterGrammarTerminates) {
     EXPECT_EQ(proc->committedOutputLen(), 2);
     EXPECT_TRUE(matcherTerminated(*proc.matcher));
 
-    auto logits = torch::zeros({1, 128}, torch::kFloat32);
-    auto inputs = makeSamplerInputs(logits);
+    auto logits        = torch::zeros({1, 128}, torch::kFloat32);
+    auto inputs        = makeSamplerInputs(logits);
     auto process_error = proc->process(inputs, 0, 1);
     ASSERT_FALSE(process_error.has_value());
 
@@ -223,7 +316,14 @@ TEST(GrammarLogitsProcessorTest, ProcessForcesEosAfterGrammarTerminates) {
 
     ASSERT_FALSE(proc->updateStatus(torch::tensor({kEos}, torch::kInt32).reshape({1, 1}), 1).has_value());
     EXPECT_EQ(proc->committedOutputLen(), 3);
-    EXPECT_TRUE(proc.matcher->finished());
+    EXPECT_FALSE(proc.matcher->finished());
+
+    auto next_logits = torch::zeros({1, 128}, torch::kFloat32);
+    auto next_inputs = makeSamplerInputs(next_logits);
+    ASSERT_FALSE(proc->process(next_inputs, 0, 1).has_value());
+    auto next_values = logitsVec(next_logits);
+    expectTokenAllowed(next_values, kEos);
+    expectTokenMasked(next_values, kA);
 }
 
 TEST(GrammarLogitsProcessorTest, UpdateStatusReportsInvalidCommittedToken) {
@@ -260,6 +360,31 @@ TEST(GrammarLogitsProcessorTest, AcceptsLegalDraftChain) {
     EXPECT_TRUE(rowAllows(bm, words, 0, kA)) << "row 0 must allow 'a'";
     EXPECT_FALSE(rowAllows(bm, words, 0, kB)) << "row 0 must NOT allow 'b' at the start";
     EXPECT_TRUE(rowAllows(bm, words, 1, kB)) << "row 1 (after 'a') must allow 'b'";
+}
+
+TEST(GrammarLogitsProcessorTest, SpecVerifyKeepsAllTrueXGrammarRowsUnconstrained) {
+    XGrammarBackend backend(makeAsciiTokenizerInfo(), defaultOptions());
+    auto            proc = makeProcessorFromKey(backend,
+                                                {"structural_tag", makeUnboundedAnyTextStructuralTag()},
+                                     /*terminate_without_stop_token=*/false);
+
+    const int            propose_step = 2;
+    const size_t         words        = SpecLogitsProcessor::bitmaskWordCount(128);
+    std::vector<int32_t> bm(static_cast<size_t>(propose_step + 1) * words, 0);
+    std::vector<int32_t> draft{kA, kX};
+
+    SpecLogitsProcessorRequest req;
+    req.draft_tokens       = draft.data();
+    req.propose_step       = propose_step;
+    req.bitmask_cpu_out    = bm.data();
+    req.bitmask_size_int32 = words;
+    req.vocab_size         = 128;
+
+    EXPECT_EQ(expectCapOk(proc->tryAcceptAndFillBitmask(req)), propose_step);
+    for (int row = 0; row <= propose_step; ++row) {
+        EXPECT_TRUE(rowAllows(bm, words, row, kA));
+        EXPECT_TRUE(rowAllows(bm, words, row, kX));
+    }
 }
 
 // A draft token that violates the grammar caps at that offset.

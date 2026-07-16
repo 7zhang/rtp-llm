@@ -116,8 +116,9 @@ LogitsProcessorFactory::createLogitsProcessors(std::shared_ptr<GenerateInput> ge
             std::move(matcher_or.value()), eos_token_id, replay_each_step);
         if (replay_each_step) {
             // MTP/speculative verification has no stable per-beam committed
-            // prefix to replay. Registering only the normal facet makes the
-            // scheduler fall back to ordinary decode for this request.
+            // prefix to replay. This processor is normal-decode-only; MTP
+            // rejects the request rather than silently producing unconstrained
+            // output.
             result.add(grammar_processor);
         } else {
             result.add(grammar_processor,
