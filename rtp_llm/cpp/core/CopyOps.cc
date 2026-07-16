@@ -1,40 +1,54 @@
-#include "rtp_llm/models_py/bindings/core/ExecOps.h"
+#include "rtp_llm/cpp/core/CopyOps.h"
+#include "rtp_llm/cpp/utils/Logger.h"
+#include "rtp_llm/models_py/bindings/core/CommonDefines.h"
 #include "rtp_llm/models_py/bindings/core/Types.h"
 #include "rtp_llm/models_py/bindings/core/torch_utils/TypeConvert.h"
-#include "rtp_llm/models_py/bindings/core/OpData.h"
-#include "rtp_llm/models_py/bindings/core/CommonDefines.h"
-#include "rtp_llm/cpp/utils/DebugUtils.h"
-#include <memory>
-#include <unistd.h>
+
+#include <cstring>
 
 #if USING_CUDA
 #include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
 #include "ATen/ops/cat.h"
 #include "rtp_llm/models_py/bindings/common/kernels/batch_copy.h"
 #include "rtp_llm/models_py/bindings/common/kernels/copy_utils.h"
-#include "rtp_llm/models_py/bindings/cuda/cuda_host_utils.h"
+#include "rtp_llm/models_py/bindings/common/kernels/fuse_copy_kernel.h"
 #include "rtp_llm/models_py/bindings/common/kernels/mask_logits.h"
-#include <cuda_profiler_api.h>
+#include "rtp_llm/models_py/bindings/cuda/cuda_host_utils.h"
 #elif USING_ROCM
 #include <ATen/hip/HIPContext.h>
-#include "rtp_llm/models_py/bindings/rocm/cuda_shims.h"
+#include <hip/hip_runtime.h>
 #include "rtp_llm/models_py/bindings/common/kernels/batch_copy.h"
 #include "rtp_llm/models_py/bindings/common/kernels/copy_utils.h"
+#include "rtp_llm/models_py/bindings/common/kernels/fuse_copy_kernel.h"
+#include "rtp_llm/models_py/bindings/rocm/cuda_shims.h"
 #include "rtp_llm/models_py/bindings/rocm/hip_host_utils.h"
 #endif
 
-using namespace std;
-
 namespace rtp_llm {
 
-#if USING_CUDA
+bool getEnableCommOverlap();  // defined in rtp_llm/cpp/runtime/CudaRuntime.cc.
 
 namespace {
+#if USING_CUDA
 at::cuda::CUDAStream& getOverlapStream() {
     static thread_local auto s = at::cuda::getStreamFromPool(/*isHighPriority=*/true);
     return s;
 }
+
+at::cuda::CUDAStream& getNoBlockCopyStream() {
+    static thread_local auto stream = at::cuda::getStreamFromPool(/*isHighPriority=*/false);
+    return stream;
+}
+#elif USING_ROCM
+at::hip::HIPStream& getOverlapStream() {
+    static thread_local auto s = at::hip::getStreamFromPool(/*isHighPriority=*/true);
+    return s;
+}
+#endif
 }  // anonymous namespace
+
+#if USING_CUDA
 
 // ============================================================
 // Copy ops (CUDA)
@@ -78,7 +92,7 @@ void runtimeCopy(const CopyParams& params) {
     check_cuda_error();
 }
 
-void multiMergeCopy(const MultiMergeCopyParams& params) {
+static void multiMergeCopyImpl(const MultiMergeCopyParams& params) {
     auto                cur_stream = at::cuda::getCurrentCUDAStream().stream();
     std::vector<void*>  multi_src_ptrs(params.src_ptrs.size());
     std::vector<size_t> multi_src_copy_sizes(params.src_ptrs.size());
@@ -130,10 +144,6 @@ static void batchCopyFallback(const BatchCopyParams& params) {
     }
 }
 
-// ============================================================
-// maskLogits (CUDA)
-// ============================================================
-
 void runtimeMaskLogits(torch::Tensor& logits, const torch::Tensor& mask) {
     size_t batch_size = logits.size(0);
     size_t vocab_size = logits.size(1);
@@ -155,13 +165,6 @@ void runtimeMaskLogits(torch::Tensor& logits, const torch::Tensor& mask) {
 
 #else  // ROCm / non-CUDA
 
-namespace {
-at::hip::HIPStream& getOverlapStream() {
-    static thread_local auto s = at::hip::getStreamFromPool(/*isHighPriority=*/true);
-    return s;
-}
-}  // anonymous namespace
-
 // ============================================================
 // Copy ops (ROCm)
 // ============================================================
@@ -179,7 +182,7 @@ void runtimeCopy(const CopyParams& params) {
     dst.copy_(src, /*non_blocking=*/src.is_hip() && dst.is_hip());
 }
 
-void multiMergeCopy(const MultiMergeCopyParams& params) {
+static void multiMergeCopyImpl(const MultiMergeCopyParams& params) {
     for (size_t i = 0; i < params.src_ptrs.size(); i++) {
         auto dst = static_cast<char*>(params.dst_ptr) + params.dst_offsets[i];
         std::memcpy(dst, params.src_ptrs[i], params.copy_size[i]);
@@ -226,7 +229,7 @@ static void batchCopyFallback(const BatchCopyParams& params) {
     }
 }
 
-void runtimeMaskLogits(torch::Tensor& logits, const torch::Tensor& mask) {
+void runtimeMaskLogits(torch::Tensor& /*logits*/, const torch::Tensor& /*mask*/) {
     throw OpException(OpErrorType::ERROR_UNIMPLEMENTED);
 }
 
@@ -242,9 +245,9 @@ void runtimeBatchCopy(const BatchCopyParams& params) {
 
 #if USING_CUDA
     auto stream_raw = at::cuda::getCurrentCUDAStream().stream();
-#else   // USING_ROCM
+#else
     auto stream_raw = at::hip::getCurrentHIPStream(at::hip::current_device()).stream();
-#endif  // USING_CUDA
+#endif
     auto         comm_stream = getOverlapStream().stream();
     bool         use_overlap = getEnableCommOverlap();
     cudaStream_t stream      = (params.overlapped && use_overlap) ? comm_stream : stream_raw;
@@ -294,7 +297,6 @@ void runtimeBatchCopy(const BatchCopyParams& params) {
 
                 check_cuda_value(cudaEventSynchronize(copy_params_done));
                 check_cuda_value(cudaEventDestroy(copy_params_done));
-
                 check_cuda_error();
             } break;
             case BatchCopyParams::H2H:
@@ -319,5 +321,55 @@ void runtimeBatchCopy(const BatchCopyParams& params) {
     batchCopyFallback(params);
 }
 #endif
+
+// ============================================================
+// execNoBlockCopy / fused / wrappers (cross-platform)
+// ============================================================
+
+void execNoBlockCopy(const CopyParams& params) {
+    params.check();
+    const auto& src = params.src;
+    const auto& dst = params.dst;
+#if USING_CUDA
+    auto stream = getNoBlockCopyStream().stream();
+    check_cuda_value(cudaMemcpyAsync(dst.data_ptr(), src.data_ptr(), src.nbytes(), cudaMemcpyDefault, stream));
+    check_cuda_value(cudaStreamSynchronize(stream));
+    check_cuda_error();
+#else
+    dst.copy_(src);
+#endif
+}
+
+void execBatchCopy(const BatchCopyParams& params) {
+    runtimeBatchCopy(params);
+}
+
+void execMultiMergeCopy(const MultiMergeCopyParams& params) {
+    multiMergeCopyImpl(params);
+}
+
+void fusedCopy(const FusedD2DCopyParams& params) {
+#if USING_CUDA
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    invokeFusedCopy(params, stream);
+#elif USING_ROCM
+    hipStream_t stream = at::hip::getCurrentHIPStream();
+    invokeFusedCopy(params, stream);
+#else
+    throw std::runtime_error("No supported GPU backend found for fusedCopy");
+#endif
+}
+
+void fusedStridedCopy(const FusedStridedCopyParams& params) {
+#if USING_CUDA
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    invokeFusedStridedCopy(params, stream);
+#elif USING_ROCM
+    hipStream_t stream = at::hip::getCurrentHIPStream();
+    invokeFusedStridedCopy(params, stream);
+#else
+    throw std::runtime_error("No supported GPU backend found for fusedStridedCopy");
+#endif
+}
 
 }  // namespace rtp_llm
