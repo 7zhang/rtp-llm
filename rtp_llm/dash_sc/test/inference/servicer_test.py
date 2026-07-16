@@ -216,6 +216,14 @@ def _finish_reason(chunk) -> int | None:
     return None
 
 
+def _finished(chunk) -> bool | None:
+    infer = chunk.infer_response
+    for i, out in enumerate(infer.outputs):
+        if out.name == "finished":
+            return infer.raw_output_contents[i] != b"\x00"
+    return None
+
+
 def _dash_error_payload(chunk) -> tuple[int, dict]:
     infer = chunk.infer_response
     return (
@@ -914,6 +922,105 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(visitor.enqueue_called, 2)
         self.assertTrue(phase1_stream.aclose_called)
+
+    async def test_phase2_empty_stream_yields_terminal_internal_error(self) -> None:
+        req = self._minimal_request()
+        phase1 = GenerateOutputs(
+            generate_outputs=[
+                GenerateOutput(
+                    output_ids=torch.tensor([10, 1], dtype=torch.int32),
+                    finished=False,
+                    aux_info=AuxInfo(input_len=4, reuse_len=0),
+                )
+            ]
+        )
+        phase2_stream = _FakeAsyncStream([])
+        visitor = _MultiStreamVisitor([_FakeAsyncStream([phase1]), phase2_stream])
+        tok = _dsv4_tokenizer()
+        env_cfg = _GenerateEnvCfg()
+
+        chunks = await _drain(
+            iter_real_model_stream_infer(
+                req,
+                [7, 8, 128821],
+                SamplingParams(),
+                OtherParams(enable_thinking=True),
+                visitor,
+                rtp_llm_request_id=100,
+                echo_prefix_ids=[128821, 198],
+                tokenizer=tok,
+                generate_env_config=env_cfg,
+                think_runtime=build_think_runtime(tok, env_cfg, "deepseek_v4"),
+                phase2_request_id_factory=lambda: 200,
+            )
+        )
+
+        error = chunks[-1]
+        error_no, payload = _dash_error_payload(error)
+        self.assertTrue(phase2_stream.aclose_called)
+        self.assertEqual(error.infer_response.id, "trace-real-2")
+        self.assertEqual(error_no, DASH_ERROR_INTERNAL.error_no)
+        self.assertIn("empty outputs_list from phase-2", payload["status_message"])
+        self.assertTrue(_finished(error))
+        self.assertEqual(_finish_reason(error), LLMFinishReason.INNER_ENGINE_ERROR)
+
+    async def test_phase2_non_terminal_chunk_then_eof_yields_internal_error(
+        self,
+    ) -> None:
+        req = self._minimal_request()
+        phase1 = GenerateOutputs(
+            generate_outputs=[
+                GenerateOutput(
+                    output_ids=torch.tensor([10, 1], dtype=torch.int32),
+                    finished=False,
+                    aux_info=AuxInfo(input_len=4, reuse_len=0),
+                )
+            ]
+        )
+        phase2 = GenerateOutputs(
+            generate_outputs=[
+                GenerateOutput(
+                    output_ids=torch.tensor([128822, 271, 20, 21], dtype=torch.int32),
+                    finished=False,
+                    aux_info=AuxInfo(input_len=4, reuse_len=0),
+                )
+            ]
+        )
+        phase2_stream = _FakeAsyncStream([phase2])
+        visitor = _MultiStreamVisitor([_FakeAsyncStream([phase1]), phase2_stream])
+        tok = _dsv4_tokenizer()
+        env_cfg = _GenerateEnvCfg()
+
+        chunks = await _drain(
+            iter_real_model_stream_infer(
+                req,
+                [7, 8, 128821],
+                SamplingParams(),
+                OtherParams(enable_thinking=True),
+                visitor,
+                rtp_llm_request_id=100,
+                echo_prefix_ids=[128821, 198],
+                tokenizer=tok,
+                generate_env_config=env_cfg,
+                think_runtime=build_think_runtime(tok, env_cfg, "deepseek_v4"),
+                phase2_request_id_factory=lambda: 200,
+            )
+        )
+
+        phase2_chunks = [
+            chunk for chunk in chunks if chunk.infer_response.id == "trace-real-2"
+        ]
+        self.assertEqual(len(phase2_chunks), 2)
+        self.assertEqual(_gen_ids(phase2_chunks[0]), [20, 21])
+        self.assertFalse(_finished(phase2_chunks[0]))
+
+        error = phase2_chunks[-1]
+        error_no, payload = _dash_error_payload(error)
+        self.assertTrue(phase2_stream.aclose_called)
+        self.assertEqual(error_no, DASH_ERROR_INTERNAL.error_no)
+        self.assertIn("before finished frame", payload["status_message"])
+        self.assertTrue(_finished(error))
+        self.assertEqual(_finish_reason(error), LLMFinishReason.INNER_ENGINE_ERROR)
 
     async def test_request_disable_thinking_prevents_token1_phase2(self) -> None:
         req = self._minimal_request()

@@ -72,6 +72,26 @@ class FrontendShutdownManagerTest(unittest.TestCase):
             time.sleep(0.01)
         return predicate()
 
+    def test_root_health_response_is_ok_in_both_deployment_modes(self):
+        for separated_frontend in (True, False):
+            with self.subTest(separated_frontend=separated_frontend):
+                app_owner = FrontendApp.__new__(FrontendApp)
+                app_owner.frontend_server = FakeFrontendServer()
+                app_owner.shutdown_manager = FrontendShutdownManager()
+                app_owner.separated_frontend = separated_frontend
+                app_owner.server_config = SimpleNamespace(http_port=0)
+                app_owner.grpc_client = None if separated_frontend else FakeGrpcClient()
+
+                response = TestClient(app_owner.create_app()).get("/")
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json(), "ok")
+                if not separated_frontend:
+                    self.assertEqual(
+                        app_owner.grpc_client.calls,
+                        [("health_check", {})],
+                    )
+
     def test_draining_rejects_new_business_and_marks_health_unavailable(self):
         app_owner = FrontendApp.__new__(FrontendApp)
         app_owner.frontend_server = FakeFrontendServer()

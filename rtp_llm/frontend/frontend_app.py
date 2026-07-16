@@ -510,7 +510,7 @@ class FrontendApp(object):
                 return draining_response()
             if self.separated_frontend:
                 await check_all_health()
-                return {"status": "home"}
+                return "ok"
             response = await self.grpc_client.post_request("health_check", {})
             if response.get("status", "") != "ok":
                 return ORJSONResponse(

@@ -370,7 +370,7 @@ async def _close_async_stream_if_possible(stream: Any, tag: str) -> None:
     try:
         await stream.aclose()
     except Exception as e:
-        logging.warning("[DashScGrpc] [%s] phase-1 stream close failed: %s", tag, e)
+        logging.warning("[DashScGrpc] [%s] backend stream close failed: %s", tag, e)
 
 
 def _phase2_max_new_tokens_for_completion_alias(
@@ -891,6 +891,8 @@ async def iter_real_model_stream_infer(
             )
             phase2_stream = await backend_visitor.enqueue(phase2_generate_input)
             phase2_cumulative_sent_ids: list[int] = []
+            phase2_received_output = False
+            phase2_received_finished = False
 
             def _build_phase2_response(
                 resp_go: Any,
@@ -1002,7 +1004,10 @@ async def iter_real_model_stream_infer(
             async for go in phase2_stream:
                 if not go.generate_outputs:
                     raise ValueError("empty generate_outputs in phase-2 backend chunk")
+                phase2_received_output = True
                 out_py = go.generate_outputs[0]
+                if out_py.finished:
+                    phase2_received_finished = True
                 generated_ids = _token_ids_list_from_generate_output(out_py)
                 if not generated_ids and not out_py.finished:
                     continue
@@ -1059,6 +1064,36 @@ async def iter_real_model_stream_infer(
                     # content will stream as content normally.
                     phase2_pending = []
                     phase2_seen_close = True
+            if not phase2_received_finished:
+                await _close_async_stream_if_possible(phase2_stream, phase2_tag)
+                status_message = (
+                    "phase-2 backend stream ended before finished frame"
+                    if phase2_received_output
+                    else "empty outputs_list from phase-2 backend"
+                )
+                logging.warning(
+                    "[DashScGrpc] [%s] %s: received_output=%s received_finished=%s",
+                    phase2_tag,
+                    status_message,
+                    phase2_received_output,
+                    phase2_received_finished,
+                )
+                error_spec = DASH_ERROR_INTERNAL
+                response = build_dash_error_response(
+                    f"{request.id}{_PHASE2_SUFFIX}",
+                    request.model_name,
+                    error_spec=error_spec,
+                    status_message=status_message,
+                )
+                stats = (
+                    0,
+                    True,
+                    error_spec.finish_reason,
+                    len(phase2_input_ids),
+                    0,
+                    (),
+                )
+                yield (response, stats) if yield_access_stats else response
     except FtRuntimeException as e:
         _set_access_backend_error_code(access_agg, e)
         error_spec = _dash_error_spec_for_ft_exception(e)
