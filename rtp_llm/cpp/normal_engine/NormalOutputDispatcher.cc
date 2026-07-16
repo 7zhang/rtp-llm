@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #if USING_CUDA
+#include "rtp_llm/models_py/bindings/cuda/kernels/mtp_target_verify_prepare.h"
 #include "rtp_llm/models_py/bindings/cuda/ops/StandaloneOps.h"
 #include "ATen/cuda/CUDAContext.h"
 #endif
@@ -222,12 +223,20 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
         auto sampled_token_lookup_ids = sampled_token_ids.clamp(0, real_vocab_size - 1);
 
         torch::Tensor log_normalizers;
+#if USING_CUDA
+        if (raw_logits.is_cuda()) {
+            auto row_logsumexp =
+                torch::empty({raw_logits.size(0)}, raw_logits.options().dtype(torch::kFloat32).requires_grad(false));
+            invokeMtpRowLogSumExp(
+                raw_logits, row_logsumexp, real_vocab_size, cuda_graph::graphGetCurrentStream().stream());
+            log_normalizers = row_logsumexp.unsqueeze(1);
+        } else
+#endif
         {
-            // Keep the temporary FP32 full-vocabulary tensor scoped to the
-            // reduction; persistent results are only O(requested_rows).
-            auto logits_fp32 =
-                raw_logits.scalar_type() == torch::kFloat32 ? raw_logits : raw_logits.to(torch::kFloat32);
-            log_normalizers = torch::logsumexp(logits_fp32, {-1}, true);
+            // CPU fallback keeps the reference implementation. CUDA uses a
+            // row reduction above so half/bfloat16 inputs never materialize a
+            // full FP32 [requested_rows, vocab] temporary.
+            log_normalizers = torch::logsumexp(raw_logits.to(torch::kFloat32), {-1}, true);
         }
         auto output_log_normalizers = log_normalizers.index_select(0, output_to_compact);
 

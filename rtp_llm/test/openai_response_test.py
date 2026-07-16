@@ -42,6 +42,7 @@ from rtp_llm.openai.renderer_factory import ChatRendererFactory, RendererParams
 from rtp_llm.openai.renderers import custom_renderer
 from rtp_llm.openai.renderers.chatglm45_renderer import ChatGlm45Renderer
 from rtp_llm.openai.renderers.deepseekv31_renderer import DeepseekV31Renderer
+from rtp_llm.openai.renderers.internvl_renderer import InternVLRenderer
 from rtp_llm.openai.renderers.kimik2_renderer import KimiK2Renderer
 from rtp_llm.openai.renderers.qwen3_code_renderer import Qwen3CoderRenderer
 from rtp_llm.openai.renderers.qwen_reasoning_tool_renderer import (
@@ -441,6 +442,16 @@ class QwenTestTokenizer(BaseTokenizer):
         self.im_end_id = self.tokenizer.im_end_id
 
 
+class CompactLogprobRawByteBackend:
+    _raw_bytes = {
+        7: b"\xe4\xbd",
+        8: b"\xa0",
+    }
+
+    def decode_single_token_bytes(self, token_id):
+        return self._raw_bytes[token_id]
+
+
 class CompactLogprobTestTokenizer:
     _pieces = {
         1: "A",
@@ -452,7 +463,13 @@ class CompactLogprobTestTokenizer:
         11: "y",
         12: "z",
         13: "A\ufffd",
+        14: " A",
+        15: " ",
     }
+
+    def __init__(self):
+        # Mirrors BaseTokenizer -> HF tokenizer -> tiktoken-style backend.
+        self.tokenizer = CompactLogprobRawByteBackend()
 
     def decode(self, token_ids):
         if isinstance(token_ids, torch.Tensor):
@@ -484,6 +501,19 @@ def create_compact_logprob_renderer(stop_word_ids=None):
             max_seq_len=128,
             eos_token_id=99,
             stop_word_ids_list=stop_word_ids or [],
+        ),
+        GenerateEnvConfig(),
+    )
+
+
+def create_compact_logprob_internvl_renderer():
+    return InternVLRenderer(
+        CompactLogprobTestTokenizer(),
+        custom_renderer.RendererParams(
+            model_type="compact_logprob_internvl_test",
+            max_seq_len=128,
+            eos_token_id=99,
+            stop_word_ids_list=[],
         ),
         GenerateEnvConfig(),
     )
@@ -594,7 +624,182 @@ class OpenaiResponseTest(IsolatedAsyncioTestCase):
         self.assertEqual(visible.output_str, "你")
         self.assertEqual(len(visible.logprobs), 2)
         self.assertEqual([len(item.top_logprobs) for item in visible.logprobs], [2, 2])
+        self.assertEqual(
+            [item.bytes for item in visible.logprobs], [[0xE4, 0xBD], [0xA0]]
+        )
         self.assertEqual(status.pending_logprobs, [])
+
+    def test_compact_logprobs_uses_raw_bytes_or_none_without_replacement(self):
+        renderer = create_compact_logprob_renderer()
+        request = ChatCompletionRequest(
+            messages=[], stream=True, logprobs=True, top_logprobs=1
+        )
+
+        records = renderer._generate_log_probs_from_tensors(
+            request,
+            torch.tensor([[7, 13]], dtype=torch.int32),
+            torch.tensor([[-0.7, -1.3]], dtype=torch.float32),
+            torch.tensor([[[8], [13]]], dtype=torch.int32),
+            torch.tensor([[[-1.0], [-2.0]]], dtype=torch.float32),
+        )
+
+        self.assertEqual(records[0].token, "\ufffd")
+        self.assertEqual(records[0].bytes, [0xE4, 0xBD])
+        self.assertEqual(records[0].top_logprobs[0].token, "")
+        self.assertEqual(records[0].top_logprobs[0].bytes, [0xA0])
+        self.assertEqual(records[1].token, "A\ufffd")
+        self.assertIsNone(records[1].bytes)
+        self.assertIsNone(records[1].top_logprobs[0].bytes)
+
+    async def test_internvl_leading_space_terminal_utf8_keeps_visible_logprob(self):
+        renderer = create_compact_logprob_internvl_renderer()
+
+        for is_streaming in (False, True):
+            with self.subTest(is_streaming=is_streaming):
+                request = ChatCompletionRequest(
+                    messages=[],
+                    stream=is_streaming,
+                    logprobs=True,
+                    top_logprobs=0,
+                )
+                status = custom_renderer.StreamStatus(request)
+
+                terminal = await renderer._update_single_status(
+                    status,
+                    make_compact_logprob_output([14, 7], [-0.1, -0.7]),
+                    2,
+                    [],
+                    [],
+                    is_streaming,
+                )
+
+                self.assertEqual(status.finish_reason, FinisheReason.length)
+                self.assertEqual(terminal.output_str, "A")
+                self.assertEqual([item.token for item in terminal.logprobs], [" A"])
+                self.assertEqual(status.pending_logprobs, [])
+
+                flushed = await renderer._flush_buffer(
+                    [status], [], is_streaming, [custom_renderer.ThinkStatus()]
+                )
+                self.assertEqual(flushed.choices[0].delta.content, "")
+                self.assertIsNone(flushed.choices[0].logprobs)
+
+    async def test_internvl_empty_normalized_delta_accounts_invisible_space(self):
+        renderer = create_compact_logprob_internvl_renderer()
+
+        for is_streaming in (False, True):
+            with self.subTest(is_streaming=is_streaming):
+                request = ChatCompletionRequest(
+                    messages=[],
+                    stream=is_streaming,
+                    logprobs=True,
+                    top_logprobs=0,
+                )
+                status = custom_renderer.StreamStatus(request)
+
+                empty = await renderer._update_single_status(
+                    status,
+                    make_compact_logprob_output([15], [-0.15]),
+                    2,
+                    [],
+                    [],
+                    is_streaming,
+                )
+
+                self.assertEqual(empty.output_str, "")
+                self.assertIsNone(empty.logprobs)
+                self.assertEqual(status.pending_logprobs, [])
+                self.assertEqual(status.emitted_logprob_token_count, 1)
+                self.assertEqual(status.last_output_ids, [])
+
+                visible = await renderer._update_single_status(
+                    status,
+                    make_compact_logprob_output([1], [-0.1]),
+                    2,
+                    [],
+                    [],
+                    is_streaming,
+                )
+
+                self.assertEqual(visible.output_str, "A")
+                self.assertEqual([item.token for item in visible.logprobs], ["A"])
+                self.assertEqual(status.pending_logprobs, [])
+                self.assertEqual(status.emitted_logprob_token_count, 2)
+
+    async def test_internvl_terminal_empty_normalized_delta_drops_logprob(self):
+        renderer = create_compact_logprob_internvl_renderer()
+
+        for is_streaming in (False, True):
+            with self.subTest(is_streaming=is_streaming):
+                request = ChatCompletionRequest(
+                    messages=[],
+                    stream=is_streaming,
+                    logprobs=True,
+                    top_logprobs=0,
+                )
+                status = custom_renderer.StreamStatus(request)
+
+                terminal = await renderer._update_single_status(
+                    status,
+                    make_compact_logprob_output([15], [-0.15]),
+                    1,
+                    [],
+                    [],
+                    is_streaming,
+                )
+
+                self.assertEqual(status.finish_reason, FinisheReason.length)
+                self.assertEqual(terminal.output_str, "")
+                self.assertIsNone(terminal.logprobs)
+                self.assertEqual(status.pending_logprobs, [])
+                self.assertEqual(status.emitted_logprob_token_count, 1)
+
+                flushed = await renderer._flush_buffer(
+                    [status], [], is_streaming, [custom_renderer.ThinkStatus()]
+                )
+                self.assertEqual(flushed.choices[0].delta.content, "")
+                self.assertIsNone(flushed.choices[0].logprobs)
+
+    async def test_internvl_empty_byte_fragment_is_not_discarded_as_space(self):
+        renderer = create_compact_logprob_internvl_renderer()
+
+        for is_streaming in (False, True):
+            with self.subTest(is_streaming=is_streaming):
+                request = ChatCompletionRequest(
+                    messages=[],
+                    stream=is_streaming,
+                    logprobs=True,
+                    top_logprobs=0,
+                )
+                status = custom_renderer.StreamStatus(request)
+
+                empty = await renderer._update_single_status(
+                    status,
+                    make_compact_logprob_output([8], [-0.8]),
+                    2,
+                    [],
+                    [],
+                    is_streaming,
+                )
+
+                self.assertEqual(empty.output_str, "")
+                self.assertIsNone(empty.logprobs)
+                self.assertEqual(len(status.pending_logprobs), 1)
+                self.assertEqual(status.emitted_logprob_token_count, 0)
+
+                visible = await renderer._update_single_status(
+                    status,
+                    make_compact_logprob_output([1], [-0.1]),
+                    2,
+                    [],
+                    [],
+                    is_streaming,
+                )
+
+                self.assertEqual(visible.output_str, "A")
+                self.assertEqual([item.token for item in visible.logprobs], ["", "A"])
+                self.assertEqual(status.pending_logprobs, [])
+                self.assertEqual(status.emitted_logprob_token_count, 2)
 
     async def test_compact_logprobs_terminal_utf8_emits_valid_prefix(self):
         renderer = create_compact_logprob_renderer()
@@ -683,6 +888,7 @@ class OpenaiResponseTest(IsolatedAsyncioTestCase):
         self.assertEqual(terminal.output_str, "A")
         self.assertEqual(len(terminal.logprobs), 1)
         self.assertEqual(terminal.logprobs[0].token, "A\ufffd")
+        self.assertIsNone(terminal.logprobs[0].bytes)
         self.assertAlmostEqual(terminal.logprobs[0].logprob, -1.3, places=6)
         self.assertEqual(status.pending_logprobs, [])
 

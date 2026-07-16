@@ -189,9 +189,10 @@ protected:
 
     void releaseAllModelBuffers();
 
-    // Decode logprob bookkeeping temporarily owns the target LM-head output.
-    // Before another target forward can allocate logits, wait only when the
-    // previous async payload actually carried that large tensor.
+    // All-request decode logprob bookkeeping aliases the full target LM-head
+    // output. Before another target forward can allocate logits, wait only
+    // when the previous async payload retained that large storage; compact
+    // mixed-batch payloads do not set the pending flag.
     void syncPendingAsyncLogprobBookkeeping();
 
 private:

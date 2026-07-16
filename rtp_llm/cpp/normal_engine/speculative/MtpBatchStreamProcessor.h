@@ -8,22 +8,31 @@
 
 namespace rtp_llm {
 
-// Target-model logprob state. Decode captures only a real-vocabulary view of
-// the raw LM-head output; after acceptance is known, bookkeeping selects the
-// emitted rows and computes reductions for those rows only. Eager prefill/tests
-// may populate row_logsumexp/top_logits before finalizeMtpTargetLogprobs().
+// Target-model logprob state. Decode keeps all P+1 rows for each requesting
+// stream, but a mixed batch copies those rows into compact storage immediately
+// so async bookkeeping does not retain the full LM-head allocation. After
+// acceptance is known, bookkeeping selects the emitted rows and computes
+// reductions for those rows only. Eager prefill/tests may populate
+// row_logsumexp/top_logits before finalizeMtpTargetLogprobs().
 struct MtpTargetLogprobs {
-    torch::Tensor raw_logits;          // raw dtype [captured_target_positions, real_vocab_size]
-    torch::Tensor row_logsumexp;       // FP32 [selected_target_positions]
-    torch::Tensor top_logits;          // raw dtype [selected_target_positions, max_k]
-    torch::Tensor source_row_indices;  // INT64 [selected_target_positions], undefined means all rows
+    torch::Tensor raw_logits;     // raw dtype [captured_target_positions, real_vocab_size]
+    torch::Tensor row_logsumexp;  // FP32 [selected_target_positions]
+    torch::Tensor top_logits;     // raw dtype [selected_target_positions, max_k]
+    // During sparse capture this maps compact raw rows to dense rows. During
+    // final selection it maps emitted output rows to compact raw rows.
+    torch::Tensor source_row_indices;
     // Pinned H2D source for sparse CUDA indices. Kept through dispatch so the
     // non-blocking copy cannot outlive its host allocation.
     torch::Tensor source_row_indices_cpu_owner;
     torch::Tensor token_logprobs;         // FP32 [selected_target_positions], defined after finalize
     torch::Tensor top_logprob_token_ids;  // INT32 [selected_target_positions, max_k]
     torch::Tensor top_logprobs;           // FP32 [selected_target_positions, max_k]
-    int64_t       requested_top_logprobs = 0;
+    // Empty means raw row i is dense target row i (the all-request identity
+    // path). Otherwise compact raw row i corresponds to this dense target row.
+    std::vector<int64_t> captured_dense_row_indices;
+    int64_t              dense_row_count              = 0;
+    bool                 retains_full_lm_head_storage = false;
+    int64_t              requested_top_logprobs       = 0;
 
     bool defined() const {
         return raw_logits.defined() || token_logprobs.defined();
@@ -40,11 +49,21 @@ struct MtpTargetLogprobs {
         }
         return top_logits.defined() ? top_logits.size(1) : requested_top_logprobs;
     }
+
+    // A compact mixed-batch payload can overlap the next model allocation.
+    // The all-request identity view must be released first because it still
+    // aliases the complete LM-head output storage.
+    bool requiresAsyncLmHeadReleaseSync() const {
+        return raw_logits.defined() && retains_full_lm_head_storage;
+    }
 };
 
-// O(1) decode capture: no row selection, logsumexp, or top-k is launched.
-MtpTargetLogprobs
-captureMtpTargetLogprobs(const torch::Tensor& logits, int64_t max_top_logprobs, int64_t real_vocab_size);
+// Identity capture is O(1). A sparse mixed-batch capture performs one compact
+// row copy, but no logsumexp or top-k is launched before acceptance is known.
+MtpTargetLogprobs captureMtpTargetLogprobs(const torch::Tensor&        logits,
+                                           int64_t                     max_top_logprobs,
+                                           int64_t                     real_vocab_size,
+                                           const std::vector<int64_t>& captured_dense_row_indices = {});
 
 MtpTargetLogprobs computeMtpTargetLogprobs(const torch::Tensor&        logits,
                                            int64_t                     max_top_logprobs,
@@ -56,11 +75,12 @@ void finalizeMtpTargetLogprobs(MtpTargetLogprobs&   target_logprobs,
                                const torch::Tensor& raw_logits_override = torch::Tensor());
 
 // Select final emitted rows, then compute logsumexp/top-k/selected-token
-// logprobs only for those rows. emitted_token_ids retains the dense target-row
-// layout and is compacted with the same source_row_indices.
+// logprobs only for those rows. emitted_token_ids and selected_dense_row_indices
+// retain the original dense target-row layout; captured metadata maps them back
+// to compact raw rows when the batch was sparse-captured.
 void finalizeSelectedMtpTargetLogprobs(MtpTargetLogprobs&          target_logprobs,
                                        const torch::Tensor&        emitted_token_ids,
-                                       const std::vector<int64_t>& source_row_indices);
+                                       const std::vector<int64_t>& selected_dense_row_indices);
 
 torch::Tensor reshapeMtpTargetAllProbs(const torch::Tensor& all_probs,
                                        int64_t              batch_size,

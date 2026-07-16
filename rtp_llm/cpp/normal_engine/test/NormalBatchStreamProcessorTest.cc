@@ -429,6 +429,73 @@ TEST_F(NormalBatchStreamProcessorTest, testCompactRawLogprobsKZeroReturnsSelecte
     expectFloatTensorNear(output.token_logprobs.value(), torch::log_softmax(logits, -1)[0][1].reshape({1}));
 }
 
+TEST_F(NormalBatchStreamProcessorTest, testCudaLogprobsRowReductionKZeroMixedBatchAndPaddedVocab) {
+    for (const auto dtype : {torch::kFloat16, torch::kBFloat16}) {
+        SCOPED_TRACE(c10::toString(dtype));
+        auto         model_config   = makeLogprobsModelConfig(5);
+        auto         processor      = makeLogprobsProcessor(model_config);
+        auto         plain_stream   = makeLogprobsStream(model_config, false, 0, 1, true);
+        auto         logprob_stream = makeLogprobsStream(model_config, true, 0, 1, true);
+        StreamGroups stream_groups({plain_stream, logprob_stream});
+
+        // The last three columns simulate TP-alignment padding and deliberately
+        // dominate the real vocabulary. Only the requested stream's second row
+        // should be snapshotted and reduced, in the original half/bfloat dtype.
+        auto padded_logits_fp32 = torch::tensor({-2.0f,
+                                                 0.5f,
+                                                 1.5f,
+                                                 3.0f,
+                                                 -1.0f,
+                                                 100.0f,
+                                                 99.0f,
+                                                 98.0f,
+                                                 4.0f,
+                                                 -2.0f,
+                                                 0.0f,
+                                                 1.0f,
+                                                 2.0f,
+                                                 80.0f,
+                                                 70.0f,
+                                                 60.0f},
+                                                torch::kFloat32)
+                                      .reshape({2, 8});
+        GptModelInputs  model_inputs;
+        GptModelOutputs model_output;
+        model_output.logits = padded_logits_fp32.to(dtype).to(torch::kCUDA);
+
+        auto sampler_input = processor->gatherSamplerInput(stream_groups, model_inputs, model_output);
+        ASSERT_TRUE(sampler_input.ok());
+        ASSERT_TRUE(sampler_input->raw_logprobs_logits.defined());
+        EXPECT_EQ(sampler_input->raw_logprobs_logits.scalar_type(), dtype);
+        EXPECT_EQ(sampler_input->raw_logprobs_logits.sizes(), (torch::IntArrayRef{1, 5}));
+        EXPECT_EQ(toVec<int64_t>(sampler_input->raw_logprobs_row_indices), (std::vector<int64_t>{1}));
+
+        MergedOutput outputs;
+        outputs.model_output                            = model_output;
+        outputs.sampler_output.token_ids                = torch::tensor({0, 1}, torch::kInt32).reshape({2, 1});
+        outputs.sampler_output.raw_logprobs_logits      = sampler_input->raw_logprobs_logits;
+        outputs.sampler_output.raw_logprobs_row_indices = sampler_input->raw_logprobs_row_indices;
+        ASSERT_TRUE(processor->dispatch(stream_groups, outputs).ok());
+
+        auto plain_result   = plain_stream->nextOutput();
+        auto logprob_result = logprob_stream->nextOutput();
+        ASSERT_TRUE(plain_result.ok());
+        ASSERT_TRUE(logprob_result.ok());
+        EXPECT_FALSE(plain_result.value().generate_outputs[0].token_logprobs.has_value());
+
+        const auto& output = logprob_result.value().generate_outputs[0];
+        ASSERT_TRUE(output.token_logprobs.has_value());
+        ASSERT_TRUE(output.top_logprob_token_ids.has_value());
+        ASSERT_TRUE(output.top_logprobs.has_value());
+        EXPECT_EQ(output.top_logprob_token_ids.value().sizes(), (torch::IntArrayRef{1, 0}));
+        EXPECT_EQ(output.top_logprobs.value().sizes(), (torch::IntArrayRef{1, 0}));
+
+        auto expected =
+            torch::log_softmax(padded_logits_fp32.index({1, torch::indexing::Slice(0, 5)}), -1).index({1}).reshape({1});
+        expectFloatTensorNear(output.token_logprobs.value(), expected, 2e-3f);
+    }
+}
+
 TEST_F(NormalBatchStreamProcessorTest, testCompactRawLogprobsMixedBatchOnlyReturnsForRequestedStream) {
     auto model_config  = makeLogprobsModelConfig();
     auto processor     = makeLogprobsProcessor(model_config);

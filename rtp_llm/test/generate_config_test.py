@@ -450,6 +450,20 @@ class OpenaiGenerateConfigTest(TestCase):
                 logprobs=True,
                 extra_configs=GenerateConfig(num_beams=2),
             )
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get current weather",
+                "parameters": {"type": "object"},
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "tool or function calling"):
+            ChatCompletionRequest(messages=[], logprobs=True, tools=[tool])
+        with self.assertRaisesRegex(ValueError, "tool or function calling"):
+            ChatCompletionRequest(
+                messages=[], logprobs=True, functions=[tool["function"]]
+            )
 
     def test_generate_config_logprobs_validation(self):
         GenerateConfig(return_logprobs=True, top_logprobs=20).validate()
@@ -581,6 +595,17 @@ class OpenaiGenerateConfigTest(TestCase):
                     tools=tools,
                     tool_choice="required",
                 ),
+                GenerateConfig(),
+            )
+
+    def test_default_renderer_rejects_logprobs_when_it_parses_thinking(self):
+        renderer = CustomChatRenderer.__new__(CustomChatRenderer)
+        renderer.think_mode = True
+
+        with self.assertRaisesRegex(Exception, "renderer parses thinking output"):
+            OpenaiEndpoint._apply_renderer_chat_constraints(
+                renderer,
+                ChatCompletionRequest(messages=[], logprobs=True),
                 GenerateConfig(),
             )
 

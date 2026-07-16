@@ -255,6 +255,8 @@ class ChatCompletionRequest(BaseModel):
         if self.logprobs is True:
             if self.n is not None and self.n > 1:
                 raise ValueError("logprobs does not support n > 1")
+            if self.tools or self.functions:
+                raise ValueError("logprobs does not support tool or function calling")
             if self.extra_configs is not None:
                 if self.extra_configs.num_return_sequences > 1:
                     raise ValueError("logprobs does not support n > 1")

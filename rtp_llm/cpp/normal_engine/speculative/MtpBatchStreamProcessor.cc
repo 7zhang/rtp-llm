@@ -1138,7 +1138,7 @@ void MtpBatchStreamProcessor::prepareDecodeSpecUpdateInfo(
     if (target_logprobs.defined() && !target_logprobs.finalized()) {
         RTP_LLM_CHECK(target_logprobs.raw_logits.defined());
         auto selected_rows = collectAcceptedMtpLogprobRows(
-            stream_groups, accept_len, static_cast<int64_t>(propose_step_ + 1), target_logprobs.raw_logits.size(0));
+            stream_groups, accept_len, static_cast<int64_t>(propose_step_ + 1), target_logprobs.dense_row_count);
         const auto& emitted_token_ids = target_logprobs.raw_logits.is_cuda()
                                                 && spec_decode_output.accept_tokens.defined()
                                                 && spec_decode_output.accept_tokens.is_cuda() ?

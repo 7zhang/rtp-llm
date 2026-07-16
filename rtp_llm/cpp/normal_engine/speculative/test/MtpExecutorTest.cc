@@ -571,6 +571,90 @@ TEST_F(MtpExecutorTest, testFinalizeSelectedMtpTargetLogprobsReducesOnlyAccepted
     EXPECT_TRUE(torch::allclose(result.top_logprobs, std::get<0>(expected_topk)));
 }
 
+TEST_F(MtpExecutorTest, testMixedMtpLogprobCaptureMapsDifferentAcceptanceLengthsOnCpu) {
+    // P=2: dense rows [0,3) and [6,9) request logprobs, while the middle
+    // stream is plain. The two requesting streams later emit 2 and 1 tokens.
+    auto                       logits              = torch::arange(0, 63, torch::kFloat32).reshape({9, 7});
+    auto                       emitted_ids         = torch::tensor({4, 3, 2, 1, 0, 4, 3, 2, 1}, torch::kInt32);
+    const std::vector<int64_t> captured_dense_rows = {0, 1, 2, 6, 7, 8};
+    const std::vector<int64_t> selected_dense_rows = {0, 1, 6};
+
+    // Every row requested: keep the zero-copy vocabulary view and require the
+    // async release sync because that view still owns the full LM-head storage.
+    auto identity_capture = captureMtpTargetLogprobs(logits,
+                                                     /*max_top_logprobs=*/2,
+                                                     /*real_vocab_size=*/5,
+                                                     /*captured_dense_row_indices=*/{0, 1, 2, 3, 4, 5, 6, 7, 8});
+    EXPECT_EQ(identity_capture.raw_logits.data_ptr<float>(), logits.data_ptr<float>());
+    EXPECT_TRUE(identity_capture.captured_dense_row_indices.empty());
+    EXPECT_TRUE(identity_capture.requiresAsyncLmHeadReleaseSync());
+
+    auto result = captureMtpTargetLogprobs(logits, /*max_top_logprobs=*/2, /*real_vocab_size=*/5, captured_dense_rows);
+
+    ASSERT_EQ(result.raw_logits.sizes(), (torch::IntArrayRef{6, 5}));
+    EXPECT_EQ(result.dense_row_count, 9);
+    EXPECT_EQ(result.captured_dense_row_indices, captured_dense_rows);
+    EXPECT_NE(result.raw_logits.data_ptr<float>(), logits.data_ptr<float>());
+    EXPECT_FALSE(result.requiresAsyncLmHeadReleaseSync());
+    EXPECT_FALSE(result.row_logsumexp.defined());
+    EXPECT_FALSE(result.top_logits.defined());
+    EXPECT_FALSE(result.top_logprob_token_ids.defined());
+
+    finalizeSelectedMtpTargetLogprobs(result, emitted_ids, selected_dense_rows);
+
+    ASSERT_TRUE(result.finalized());
+    auto dense_indices   = torch::tensor(selected_dense_rows, torch::kInt64);
+    auto expected_logits = logits.narrow(1, 0, 5).index_select(0, dense_indices);
+    auto expected        = torch::log_softmax(expected_logits, -1);
+    auto expected_ids    = emitted_ids.index_select(0, dense_indices).to(torch::kInt64);
+    auto expected_topk   = expected.topk(2, -1, true, true);
+    EXPECT_TRUE(torch::allclose(result.token_logprobs, expected.gather(1, expected_ids.unsqueeze(1)).squeeze(1)));
+    EXPECT_TRUE(torch::equal(result.top_logprob_token_ids, std::get<1>(expected_topk).to(torch::kInt32)));
+    EXPECT_TRUE(torch::allclose(result.top_logprobs, std::get<0>(expected_topk)));
+}
+
+TEST_F(MtpExecutorTest, testMixedMtpLogprobCaptureMapsDifferentAcceptanceLengthsOnCuda) {
+    // Same mixed P=2 layout as the CPU case, with acceptance lengths 1 and 3.
+    // Padded vocabulary columns must neither be retained nor reduced.
+    auto logits =
+        torch::arange(0, 63, torch::TensorOptions().dtype(torch::kFloat16).device(torch::kCUDA)).reshape({9, 7});
+    auto emitted_ids =
+        torch::tensor({4, 3, 2, 1, 0, 4, 3, 2, 1}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+    const std::vector<int64_t> captured_dense_rows = {0, 1, 2, 6, 7, 8};
+    const std::vector<int64_t> selected_dense_rows = {0, 6, 7, 8};
+
+    auto identity_capture = captureMtpTargetLogprobs(logits, /*max_top_logprobs=*/2, /*real_vocab_size=*/5);
+    EXPECT_EQ(identity_capture.raw_logits.data_ptr<at::Half>(), logits.data_ptr<at::Half>());
+    EXPECT_TRUE(identity_capture.requiresAsyncLmHeadReleaseSync());
+
+    auto result = captureMtpTargetLogprobs(logits, /*max_top_logprobs=*/2, /*real_vocab_size=*/5, captured_dense_rows);
+
+    ASSERT_EQ(result.raw_logits.sizes(), (torch::IntArrayRef{6, 5}));
+    EXPECT_NE(result.raw_logits.data_ptr<at::Half>(), logits.data_ptr<at::Half>());
+    EXPECT_FALSE(result.requiresAsyncLmHeadReleaseSync());
+    ASSERT_TRUE(result.source_row_indices_cpu_owner.defined());
+    EXPECT_TRUE(result.source_row_indices_cpu_owner.is_pinned());
+    EXPECT_EQ(toVec<int64_t>(result.source_row_indices_cpu_owner), captured_dense_rows);
+    EXPECT_FALSE(result.row_logsumexp.defined());
+    EXPECT_FALSE(result.top_logits.defined());
+
+    finalizeSelectedMtpTargetLogprobs(result, emitted_ids, selected_dense_rows);
+
+    ASSERT_TRUE(result.finalized());
+    // Dense accepted rows [0,6,7,8] map to compact raw rows [0,3,4,5].
+    EXPECT_EQ(toVec<int64_t>(result.source_row_indices_cpu_owner), (std::vector<int64_t>{0, 3, 4, 5}));
+    auto dense_indices =
+        torch::tensor(selected_dense_rows, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
+    auto expected_logits = logits.narrow(1, 0, 5).index_select(0, dense_indices).to(torch::kFloat32);
+    auto expected        = torch::log_softmax(expected_logits, -1);
+    auto expected_ids    = emitted_ids.index_select(0, dense_indices).to(torch::kInt64);
+    auto expected_topk   = expected.topk(2, -1, true, true);
+    EXPECT_TRUE(torch::allclose(
+        result.token_logprobs.cpu(), expected.gather(1, expected_ids.unsqueeze(1)).squeeze(1).cpu(), 1e-3, 1e-3));
+    EXPECT_TRUE(torch::equal(result.top_logprob_token_ids.cpu(), std::get<1>(expected_topk).to(torch::kInt32).cpu()));
+    EXPECT_TRUE(torch::allclose(result.top_logprobs.cpu(), std::get<0>(expected_topk).cpu(), 1e-3, 1e-3));
+}
+
 TEST_F(MtpExecutorTest, testComputeMtpTargetLogprobsExcludesPaddedVocabColumns) {
     auto logits      = torch::tensor({{1.0f, 2.0f, 3.0f, 4.0f, 100.0f, 90.0f}, {4.0f, 1.0f, 3.0f, 2.0f, 80.0f, 70.0f}},
                                 torch::kFloat32);

@@ -326,7 +326,11 @@ TEST_F(MtpBatchStreamProcessorTest, testDecodeTargetLogprobsUseCompactOffsetsFor
                                           {1.0f, 0.0f, 5.0f, 4.0f, 3.0f},
                                           {2.0f, 1.0f, 0.0f, 5.0f, 3.0f}},
                                       torch::kFloat32);
-    auto target_logprobs = captureMtpTargetLogprobs(dense_logits, /*max_top_logprobs=*/2, /*real_vocab_size=*/5);
+    auto target_logprobs = captureMtpTargetLogprobs(
+        dense_logits, /*max_top_logprobs=*/2, /*real_vocab_size=*/5, /*captured_dense_row_indices=*/{2, 3});
+    EXPECT_EQ(target_logprobs.raw_logits.size(0), 2);
+    EXPECT_EQ(target_logprobs.dense_row_count, 4);
+    EXPECT_FALSE(target_logprobs.requiresAsyncLmHeadReleaseSync());
     EXPECT_FALSE(target_logprobs.row_logsumexp.defined());
     EXPECT_FALSE(target_logprobs.top_logits.defined());
 

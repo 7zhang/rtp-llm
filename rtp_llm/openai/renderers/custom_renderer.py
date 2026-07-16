@@ -461,6 +461,7 @@ class CustomChatRenderer:
             self.tokenizer.decode(stop_word_ids)
             for stop_word_ids in self.stop_words_id_list
         ]
+        self._tokenizer_byte_candidates: Optional[List[Any]] = None
         self.ckpt_path = renderer_params.ckpt_path
         # NOTE: stop words or their ids only need to be added to one of these two lists.
         self.extra_stop_words: List[str] = []
@@ -546,6 +547,11 @@ class CustomChatRenderer:
     def apply_chat_completion_constraints(
         self, request: ChatCompletionRequest, generate_config: GenerateConfig
     ) -> None:
+        if request.logprobs and self.should_process_think(request):
+            raise FtRuntimeException(
+                ExceptionType.INVALID_PARAMS,
+                "logprobs is not supported when the renderer parses thinking output",
+            )
         tool_choice = getattr(request, "tool_choice", None)
         if tool_choice is None or tool_choice in ("auto", "none"):
             return
@@ -712,6 +718,161 @@ class CustomChatRenderer:
             reuse_length=aux_info.reuse_len,
         )
 
+    def _token_id_to_bytes(
+        self, token_id: int, decoded_token: str
+    ) -> Optional[List[int]]:
+        """Return exact token bytes when the tokenizer exposes them.
+
+        Byte-level tokenizers can decode an individual, incomplete UTF-8 token as
+        U+FFFD (or as an empty string). Encoding that display string would invent
+        replacement bytes which were never sampled. Prefer raw-token APIs and
+        decoder tables; only fall back to UTF-8 encoding when the decoded token is
+        complete. ``None`` means the original bytes cannot be recovered safely.
+        """
+
+        # A complete per-token decode already identifies the exact UTF-8 bytes
+        # represented by the API's token string. Raw-backend discovery is only
+        # needed for byte fragments that decode to U+FFFD or an empty string.
+        if decoded_token and "\ufffd" not in decoded_token:
+            try:
+                return list(decoded_token.encode("utf-8"))
+            except UnicodeEncodeError:
+                return None
+
+        def normalize_raw_bytes(value: Any) -> Optional[List[int]]:
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                return list(bytes(value))
+            if (
+                isinstance(value, (list, tuple))
+                and value
+                and all(
+                    isinstance(item, int)
+                    and not isinstance(item, bool)
+                    and 0 <= item <= 255
+                    for item in value
+                )
+            ):
+                return list(value)
+            return None
+
+        # BaseTokenizer wraps a HuggingFace tokenizer, which may itself wrap a
+        # tiktoken/tokenizers/SentencePiece backend. Walk the small adapter graph
+        # so decode_single_token_bytes(), byte decoder tables, and byte-fallback
+        # pieces remain usable without requiring one tokenizer implementation.
+        candidates = self._tokenizer_byte_candidates
+        if candidates is None:
+            candidates = []
+            pending: List[Any] = [self.tokenizer]
+            seen: set[int] = set()
+            while pending and len(candidates) < 16:
+                candidate = pending.pop(0)
+                if candidate is None or id(candidate) in seen:
+                    continue
+                seen.add(id(candidate))
+                candidates.append(candidate)
+
+                get_real_tokenizer = getattr(candidate, "get_real_tokenizer", None)
+                if callable(get_real_tokenizer):
+                    try:
+                        pending.append(get_real_tokenizer())
+                    except Exception:
+                        pass
+                for attribute in (
+                    "tokenizer",
+                    "_tokenizer",
+                    "backend_tokenizer",
+                    "model",
+                    "sp_model",
+                ):
+                    try:
+                        pending.append(getattr(candidate, attribute, None))
+                    except Exception:
+                        pass
+            self._tokenizer_byte_candidates = candidates
+
+        token_pieces: List[str] = []
+        for candidate in candidates:
+            for method_name in ("token_id_to_bytes", "decode_single_token_bytes"):
+                method = getattr(candidate, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    value = method(token_id)
+                except Exception:
+                    continue
+                raw_bytes = normalize_raw_bytes(value)
+                if raw_bytes is not None:
+                    return raw_bytes
+                if isinstance(value, str):
+                    token_pieces.append(value)
+
+            decoder = getattr(candidate, "decoder", None)
+            decoder_get = getattr(decoder, "get", None)
+            if callable(decoder_get):
+                try:
+                    value = decoder_get(token_id)
+                except Exception:
+                    value = None
+                raw_bytes = normalize_raw_bytes(value)
+                if raw_bytes is not None:
+                    return raw_bytes
+                if isinstance(value, str):
+                    token_pieces.append(value)
+
+            for method_name in (
+                "convert_ids_to_tokens",
+                "_convert_id_to_token",
+                "id_to_token",
+                "id_to_piece",
+                "IdToPiece",
+            ):
+                method = getattr(candidate, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    value = method(token_id)
+                except Exception:
+                    continue
+                if isinstance(value, list) and len(value) == 1:
+                    value = value[0]
+                raw_bytes = normalize_raw_bytes(value)
+                if raw_bytes is not None:
+                    return raw_bytes
+                if isinstance(value, str):
+                    token_pieces.append(value)
+
+        for piece in token_pieces:
+            if (
+                len(piece) == 6
+                and piece.startswith(("<0x", "<0X"))
+                and piece.endswith(">")
+            ):
+                try:
+                    return [int(piece[3:5], 16)]
+                except ValueError:
+                    pass
+
+            if not piece:
+                continue
+            for candidate in candidates:
+                byte_decoder = getattr(candidate, "byte_decoder", None)
+                decoder_get = getattr(byte_decoder, "get", None)
+                if not callable(decoder_get):
+                    continue
+                try:
+                    values = [decoder_get(char) for char in piece]
+                except Exception:
+                    continue
+                if all(
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and 0 <= value <= 255
+                    for value in values
+                ):
+                    return list(values)
+
+        return None
+
     def _generate_log_probs_from_tensors(
         self,
         request: ChatCompletionRequest,
@@ -813,7 +974,7 @@ class CustomChatRenderer:
             token = self.tokenizer.decode([token_id])
             token_result = ChatCompletionTokenLogprob(
                 token=token,
-                bytes=list(token.encode("utf-8", errors="replace")),
+                bytes=self._token_id_to_bytes(token_id, token),
                 logprob=token_logprob_tensor.item(),
                 top_logprobs=[],
             )
@@ -828,7 +989,9 @@ class CustomChatRenderer:
                         TopLogprob(
                             token=top_token,
                             logprob=top_logprob.item(),
-                            bytes=list(top_token.encode("utf-8", errors="replace")),
+                            bytes=self._token_id_to_bytes(
+                                top_token_id.item(), top_token
+                            ),
                         )
                     )
             result.append(token_result)
