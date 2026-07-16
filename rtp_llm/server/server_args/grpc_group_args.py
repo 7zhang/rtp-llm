@@ -31,7 +31,13 @@ def default_model_grpc_config_json() -> str:
 
 
 def default_dash_sc_grpc_config_json() -> str:
-    return default_model_grpc_config_json()
+    config = json.loads(default_model_grpc_config_json())
+    # DashSc input_ids arrive in request messages, so the server needs the
+    # same 1 GiB receive allowance that its client and Model RPC already use.
+    config["server_config"]["grpc.max_receive_message_length"] = (
+        _MODEL_RPC_GRPC_RECV_AND_METADATA_BYTES
+    )
+    return json.dumps(config, separators=(",", ":"))
 
 
 def _grpc_config_from_json(grpc_config):

@@ -25,8 +25,9 @@ from rtp_llm.dash_sc.grpc_metrics import (
     report_chunk,
     report_forwarder_rpc_done,
 )
-from rtp_llm.dash_sc.proto import predict_v2_pb2, predict_v2_pb2_grpc
+from rtp_llm.dash_sc.proto import predict_v2_pb2
 from rtp_llm.dash_sc.proxy.service_route import create_service_discovery_from_env
+from rtp_llm.dash_sc.servicer_base import DashScHealthState, DashScServicerBase
 from rtp_llm.utils.grpc_host_channel_pool import GrpcHostChannelPool
 
 _FORWARD_CHANNEL_OPTS: list[tuple[str, int]] = [
@@ -82,7 +83,7 @@ async def _abort_with_downstream_grpc_error(context, exc: grpc.aio.AioRpcError) 
     await context.abort(code, details)
 
 
-class DashScProxyServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
+class DashScProxyServicer(DashScServicerBase):
     """Pure transparent proxy (grpc.aio) across discovered downstream addrs."""
 
     def __init__(
@@ -90,7 +91,9 @@ class DashScProxyServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
         *,
         rank_id: Optional[int] = None,
         server_id: str = "",
+        health_state: Optional[DashScHealthState] = None,
     ):
+        super().__init__(health_state)
         self._channel_pool = GrpcHostChannelPool(
             options=_FORWARD_CHANNEL_OPTS,
             cleanup_interval=_CHANNEL_CLEANUP_INTERVAL_S,
@@ -441,6 +444,11 @@ class DashScProxyServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
             try:
                 buffered = await it.__anext__()
             except StopAsyncIteration:
+                return
+            if _is_stream_done(buffered):
+                yield buffered
+                buffered = None
+                _set_stage("flushed_terminal_first")
                 return
             _set_stage("waiting_second")
             try:

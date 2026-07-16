@@ -752,14 +752,15 @@ class ProcessManager:
             # iterations). Inspect final exitcodes to surface silent crashes
             # the monitor missed.
             if not self.shutdown_requested and not self.failure_detected:
-                crashed = [
+                unexpected_exits = [
                     (p.name, p.exitcode)
                     for p in self.processes
-                    if p.exitcode is not None and p.exitcode != 0
+                    if p.exitcode is not None
                 ]
-                if crashed:
+                if unexpected_exits:
                     logging.error(
-                        f"Children exited non-zero without shutdown request: {crashed}"
+                        "Children exited without shutdown request: "
+                        f"{unexpected_exits}"
                     )
                     self.failure_detected = True
         else:

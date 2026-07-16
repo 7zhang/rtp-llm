@@ -145,6 +145,24 @@ class DashScGrpcRequestTest(TestCase):
         _add_tensor(req, "input_ids", "INT64", [2], raw)
         self.assertEqual(parse_input_ids_from_request(req), [7, -1])
 
+    def test_parse_input_ids_single_batch_shape(self) -> None:
+        req = predict_v2_pb2.ModelInferRequest()
+        raw = struct.pack("<2i", 7, 8)
+        _add_tensor(req, "input_ids", "INT32", [1, 2], raw)
+        self.assertEqual(parse_input_ids_from_request(req), [7, 8])
+
+    def test_parse_input_ids_rejects_shape_content_mismatch(self) -> None:
+        req = predict_v2_pb2.ModelInferRequest()
+        raw = struct.pack("<2i", 7, 8)
+        _add_tensor(req, "input_ids", "INT32", [3], raw)
+        self.assertIsNone(parse_input_ids_from_request(req))
+
+    def test_parse_input_ids_rejects_multiple_batches(self) -> None:
+        req = predict_v2_pb2.ModelInferRequest()
+        raw = struct.pack("<2i", 7, 8)
+        _add_tensor(req, "input_ids", "INT32", [2, 1], raw)
+        self.assertIsNone(parse_input_ids_from_request(req))
+
     def test_parse_input_ids_missing_tensor(self) -> None:
         req = predict_v2_pb2.ModelInferRequest()
         self.assertIsNone(parse_input_ids_from_request(req))
@@ -217,6 +235,14 @@ class DashScGrpcRequestTest(TestCase):
         self.assertEqual(
             raised.exception.exception_type, ExceptionType.UNSUPPORTED_OPERATION
         )
+
+        req = predict_v2_pb2.ModelInferRequest()
+        req.parameters["response_format"].string_param = json.dumps(
+            {"type": "text"}
+        )
+        config = parse_sampling_params(req).to_generate_config()
+        self.assertIsNone(config.response_format)
+        config.validate()
 
         req = predict_v2_pb2.ModelInferRequest()
         req.parameters["json_format"].bool_param = True

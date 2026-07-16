@@ -663,6 +663,19 @@ class AccessLogDiagInjectionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.buffered_stage, "flushed_first")
         self.assertEqual(record.backend_resp_count, 1)
 
+    async def test_terminal_first_chunk_is_not_held_for_a_second_chunk(self) -> None:
+        record = GrpcAccessRecord.create(MagicMock(), "test", "bidi_stream")
+        terminal = _make_finished_response()
+
+        async def terminal_only():
+            yield terminal
+            self.fail("proxy requested a second frame after terminal response")
+
+        chunks = await _drain(self.servicer._buffered_iter(terminal_only(), record))
+
+        self.assertEqual(chunks, [terminal])
+        self.assertEqual(record.buffered_stage, "flushed_terminal_first")
+
     async def test_stage_flushed_both_on_happy_path(self) -> None:
         self._patch_addr(0)
         self.mock_stub.ModelStreamInfer.return_value = _AsyncIter(

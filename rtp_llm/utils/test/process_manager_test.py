@@ -1711,6 +1711,16 @@ class TestFailureShutdownPaths(unittest.TestCase):
             self.manager.monitor_and_release_processes()
             mock_exit.assert_not_called()
 
+    def test_unrequested_clean_child_exit_still_exits_parent_nonzero(self):
+        """Exit code 0 is only graceful after the parent requested shutdown."""
+        self.manager.add_process(_FakeProc("frontend", alive=False, exitcode=0))
+
+        with patch("os._exit") as mock_exit:
+            self.manager.monitor_and_release_processes()
+
+        self.assertTrue(self.manager.failure_detected)
+        mock_exit.assert_called_once_with(1)
+
     # --- normal SIGTERM with alive backend keeps -1 semantics ---------------
 
     def test_signal_shutdown_alive_backend_no_force_kill(self):

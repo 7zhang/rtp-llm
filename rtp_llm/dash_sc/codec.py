@@ -509,6 +509,11 @@ def _parse_grammar_controls(
     if guided_response_format is not None:
         response_format = guided_response_format
 
+    # ``{"type": "text"}`` is the OpenAI-compatible spelling of the default
+    # unconstrained mode. Do not carry it as an unsupported grammar sentinel.
+    if response_format == {"type": "text"}:
+        response_format = None
+
     if json_format_value is None:
         json_format_value = _parse_optional_bool(
             _lookup_ds_request_control(ds_attrs, "json_format")
@@ -734,12 +739,27 @@ class SamplingParams:
 def parse_input_ids_from_request(request) -> list[int] | None:
     """Read ``input_ids`` (INT32 / INT64, little-endian).
 
-    Returns ``None`` if tensor missing, index mismatch, or unsupported datatype.
+    A request represents one prompt, so accept the native ``[tokens]`` shape and
+    the Triton-compatible single-batch ``[1, tokens]`` shape only. Returns
+    ``None`` when tensor metadata and raw contents do not describe that contract.
     """
     inp, raw = _find_input_raw(request, "input_ids")
     if inp is None or raw is None:
         return None
-    return _parse_int_tensor_flat(inp, raw)
+    input_ids = _parse_int_tensor_flat(inp, raw)
+    if input_ids is None:
+        return None
+
+    shape = list(inp.shape)
+    if len(shape) == 1:
+        token_count = shape[0]
+    elif len(shape) == 2 and shape[0] == 1:
+        token_count = shape[1]
+    else:
+        return None
+    if token_count < 0 or token_count != len(input_ids):
+        return None
+    return input_ids
 
 
 def parse_sampling_params(

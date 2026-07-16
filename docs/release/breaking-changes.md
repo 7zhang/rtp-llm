@@ -19,6 +19,6 @@
 **Migration:**
 
 1. Reconfigure discovery and firewall rules for the new layout with a stride of at least `9`.
-2. Non-VIT deployments start DashSc gRPC and reject smaller strides before starting any server process. VIT-only deployments, which do not start DashSc, may retain a smaller stride when required.
+2. Non-VIT deployments start DashSc gRPC and reject smaller strides before starting any server process. DashSc is intentionally a mandatory companion of the HTTP frontend and has no independent disable switch. VIT-only deployments, which do not start DashSc, may retain a smaller stride when required.
 
 See also: [DashSc gRPC — listen ports](../backend/DashSc-gRPC.md).

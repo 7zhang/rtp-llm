@@ -507,8 +507,12 @@ def start_server(py_env_configs: PyEnvConfigs):
         )
         py_env_configs.role_config.role_type = RoleType.VIT
 
+    # Architecture invariant: DashSc is a mandatory companion of every non-VIT
+    # frontend. It intentionally shares the frontend lifecycle and has no
+    # feature flag; startup must fail if either protocol endpoint cannot start.
+    dash_sc_enabled = py_env_configs.role_config.role_type != RoleType.VIT
     py_env_configs.server_config.validate_port_layout(
-        dash_sc_enabled=py_env_configs.role_config.role_type != RoleType.VIT
+        dash_sc_enabled=dash_sc_enabled
     )
 
     # Initialize backend_process to None in case role_type is FRONTEND
@@ -535,8 +539,9 @@ def start_server(py_env_configs: PyEnvConfigs):
             )
             process_manager.add_processes(frontend_process, shutdown_group="frontend")
 
-            # DashSC is intentionally a mandatory companion of every non-VIT
-            # frontend deployment; its startup is not controlled by a feature flag.
+            # Keep DashSc and HTTP frontend in the same mandatory availability
+            # unit: both are started for non-VIT roles and either startup
+            # failure fails the deployment instead of silently degrading.
             dash_sc_processes = start_dash_sc_server_impl(
                 global_controller, py_env_configs, process_manager
             )

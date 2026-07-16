@@ -321,7 +321,7 @@ class DashScGrpcDrainAioInterceptor(grpc.aio.ServerInterceptor):
             return handler
 
         method = handler_call_details.method
-        if self._is_liveness_method(method):
+        if self._is_health_method(method):
             return handler
         if handler.request_streaming and handler.response_streaming:
             return grpc.stream_stream_rpc_method_handler(
@@ -348,8 +348,8 @@ class DashScGrpcDrainAioInterceptor(grpc.aio.ServerInterceptor):
         )
 
     @staticmethod
-    def _is_liveness_method(method: str) -> bool:
-        return method.endswith("/ServerLive")
+    def _is_health_method(method: str) -> bool:
+        return method.endswith(("/ServerLive", "/ServerReady", "/ModelReady"))
 
     async def _begin_or_abort(self, context, method: str) -> bool:
         if self._shutdown_manager.try_begin_request():

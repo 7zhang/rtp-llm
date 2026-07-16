@@ -57,6 +57,11 @@ class TestStructuredOutputUnsupported(unittest.TestCase):
     def test_default_structured_output_controls_remain_valid(self):
         GenerateConfig().validate()
 
+    def test_plain_text_response_format_remains_valid(self):
+        for value in ({"type": "text"}, '{"type":"text"}', "text"):
+            with self.subTest(value=value):
+                GenerateConfig(response_format=value).validate()
+
 
 class TestClampDivergeStartCombo(unittest.TestCase):
 

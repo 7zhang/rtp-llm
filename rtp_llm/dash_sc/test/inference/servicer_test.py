@@ -134,6 +134,11 @@ class DashErrorSpecForFtExceptionTest(unittest.TestCase):
             (ExceptionType.GENERATE_TIMEOUT, DASH_ERROR_TIMEOUT),
             (ExceptionType.OUT_OF_VOCAB_RANGE, DASH_ERROR_INVALID_OUTPUT),
             (ExceptionType.CANCELLED_ERROR, DASH_ERROR_ABORT),
+            (
+                ExceptionType.P2P_CONNECTOR_WORKER_HANDLE_READ_CANCELLED,
+                DASH_ERROR_ABORT,
+            ),
+            (ExceptionType.P2P_CONNECTOR_WORKER_READ_CANCELLED, DASH_ERROR_ABORT),
         )
         for exception_type, expected in cases:
             with self.subTest(exception_type=exception_type):
@@ -1649,20 +1654,20 @@ class DashScInferenceServicerTest(unittest.IsolatedAsyncioTestCase):
         }
         self.assertEqual(_unpack_int32_le(by_name["generated_ids"]), [142])
 
-    async def test_multiple_requests_in_one_stream_are_rejected(self) -> None:
+    async def test_successful_single_request_ends_without_reading_another(self) -> None:
         servicer = DashScInferenceServicer(backend_visitor=None)
         first = self._valid_infer_request()
-        second = self._valid_infer_request()
-        second.id = "srv-2"
+
+        async def one_request():
+            yield first
+            self.fail("server requested a second frame after terminal response")
 
         responses = await _drain(
-            servicer.ModelStreamInfer(_areq_iter([first, second]), MagicMock())
+            servicer.ModelStreamInfer(one_request(), MagicMock())
         )
 
-        self.assertEqual(len(responses), 2)
+        self.assertEqual(len(responses), 1)
         self.assertEqual(responses[0].infer_response.id, "srv-1")
-        _assert_parameter_error_response(self, responses[1], "open a new stream")
-        self.assertEqual(responses[1].infer_response.id, "srv-2")
 
     async def test_multiple_return_sequences_are_rejected_before_enqueue(
         self,
@@ -2131,6 +2136,21 @@ class DashScInferenceServicerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(responses), 1)
         _assert_unsupported_error_response(self, responses[0], "response_format")
 
+    async def test_dash_generation_plain_text_response_format_is_accepted(
+        self,
+    ) -> None:
+        visitor = _FakeVisitor(_FakeAsyncStream([]))
+        servicer = DashScInferenceServicer(backend_visitor=visitor)
+        req = self._valid_infer_request()
+        req.parameters["response_format"].string_param = json.dumps(
+            {"type": "text"}
+        )
+
+        await _drain(servicer.ModelStreamInfer(_areq_iter([req]), MagicMock()))
+
+        self.assertEqual(visitor.enqueue_called, 1)
+        self.assertIsNone(visitor.last_generate_input.generate_config.response_format)
+
     async def test_dash_generation_guided_json_is_rejected_as_unsupported(
         self,
     ) -> None:
@@ -2348,6 +2368,20 @@ class DashScInferenceServicerTest(unittest.IsolatedAsyncioTestCase):
             visitor.last_generate_input.headers,
             {"user_id": "u1", "x-dashscope-apikeyid": "ak1"},
         )
+
+    async def test_short_upstream_timeout_keeps_engine_deadline_shorter(self) -> None:
+        visitor = _FakeVisitor(_FakeAsyncStream([]))
+        servicer = DashScInferenceServicer(backend_visitor=visitor)
+        request = self._valid_infer_request()
+        request.parameters["ds_header_attributes"].string_param = json.dumps(
+            {"x-dashscope-inner-timeout": 1}
+        )
+
+        await _drain(servicer.ModelStreamInfer(_areq_iter([request]), MagicMock()))
+
+        generate_config = visitor.last_generate_input.generate_config
+        self.assertEqual(generate_config.timeout_ms, 850)
+        self.assertEqual(generate_config.ttft_timeout_ms, 850)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ DashSc gRPC 在进程内提供 **predict_v2 协议**（`predict_v2.proto`）的 
 |------|------|
 | Proto | `rtp_llm/dash_sc/proto/predict_v2.proto`（及 `model_config.proto`） |
 | 服务名 | `GRPCInferenceService` |
-| RPC | `ModelStreamInfer`（客户端发送一个或多个 `ModelInferRequest`，服务端流式返回 `ModelStreamInferResponse`） |
+| RPC | `ModelStreamInfer`（每条双向流发送一个 `ModelInferRequest`，服务端流式返回 `ModelStreamInferResponse`） |
 | 地址 | `0.0.0.0:<dash_sc_grpc_server_port>`（与下面端口计算一致） |
 
 任意支持同一 `.proto` 的 gRPC 客户端均可调用；仓库内自带 Python 客户端（见下文）。
@@ -84,6 +84,8 @@ python -m rtp_llm.dash_sc.client \
 常用参数：`--tokenizer_path`（默认与 `ckpt_path` 相同）、`--request_id`、`--model_name`，以及 `--max_new_tokens`、`--top_k`、`--top_p`、`--temperature` 等采样参数。若服务端选项与默认不一致，可传 `--dash_sc_grpc_config_json` 以匹配 channel 的 `client_config`。
 
 DeepSeek-V4 的 dash-sc 请求是预 tokenized wire。Python 客户端只做 raw-token 调试：`tokenizer.encode(prompt)` 后发送 `input_ids`。真实 chat prompt 渲染、工具调用语义和 reasoning 参数归一化应由 OpenAI / DashScope 前端链路完成，dash-sc gRPC 层只承接已编码的 `input_ids` 和 generation 参数。
+
+`ModelStreamInfer` 的协议约定是一条双向流承载一个 `ModelInferRequest`；收到终止响应后服务端结束响应流，下一次请求需新建流。
 
 ### 结构化输出
 

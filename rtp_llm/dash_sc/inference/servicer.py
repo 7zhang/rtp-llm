@@ -52,8 +52,9 @@ from rtp_llm.dash_sc.grpc_metrics import (
     report_chunk,
     report_frontend_rpc_done,
 )
-from rtp_llm.dash_sc.proto import predict_v2_pb2, predict_v2_pb2_grpc
+from rtp_llm.dash_sc.proto import predict_v2_pb2
 from rtp_llm.dash_sc.repetition_monitor import RequestRepetitionMonitorConfig
+from rtp_llm.dash_sc.servicer_base import DashScHealthState, DashScServicerBase
 from rtp_llm.frontend.request_id_generator import generate_request_id
 from rtp_llm.metrics import AccMetrics, kmonitor
 from rtp_llm.server.request_headers import (
@@ -433,8 +434,11 @@ def _apply_request_overrides(
         # Subtract a margin so the engine times out BEFORE the upstream gateway
         # sends RST_STREAM. This ensures the timeout surfaces as a normal
         # finish_reason=STOP_TIMEOUT response (200) rather than gRPC CANCELLED (5xx).
-        margin_ms = max(2000, min(5000, int(other.timeout_ms * 0.15)))
-        engine_timeout_ms = max(5000, int(other.timeout_ms) - margin_ms)
+        upstream_timeout_ms = int(other.timeout_ms)
+        margin_ms = min(5000, max(1, int(upstream_timeout_ms * 0.15)))
+        # Very short upstream deadlines still need a shorter engine deadline;
+        # a fixed 5s floor would instead let the gateway cancel first.
+        engine_timeout_ms = max(1, upstream_timeout_ms - margin_ms)
         generate_config.timeout_ms = engine_timeout_ms
         generate_config.ttft_timeout_ms = engine_timeout_ms
     if other.traffic_reject_priority is not None:
@@ -1091,7 +1095,7 @@ async def iter_real_model_stream_infer(
 # ----------------------------------------------------------------------------
 
 
-class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
+class DashScInferenceServicer(DashScServicerBase):
     """ModelStreamInfer: fake mode (mock) or real mode (``backend_visitor.enqueue``).
 
     ``ip`` / ``port`` / ``server_id`` derive the snowflake-style ``GenerateInput.request_id``
@@ -1115,7 +1119,9 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
         think_runtime: Optional[_ThinkRuntime] = None,
         rank_id: Optional[int] = None,
         repetition_monitor_config: Optional[RequestRepetitionMonitorConfig] = None,
+        health_state: Optional[DashScHealthState] = None,
     ):
+        super().__init__(health_state)
         self._backend_visitor = backend_visitor
         self._ip = ip
         self._port = port
@@ -1243,26 +1249,6 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                     request.id,
                     request.model_name,
                 )
-                if not first_request:
-                    error_spec = DASH_ERROR_BAD_REQUEST
-                    resp = build_dash_error_response(
-                        str(request.id),
-                        request.model_name,
-                        error_spec=error_spec,
-                        status_message=(
-                            "multiple requests in one ModelStreamInfer stream are "
-                            "not supported; open a new stream for each request"
-                        ),
-                    )
-                    self._record_and_report_chunk(
-                        record,
-                        resp,
-                        delta_len=0,
-                        finished=True,
-                        finish_reason=error_spec.finish_reason,
-                    )
-                    yield resp
-                    return
                 try:
                     input_ids_list, sampling, other = parse_dash_sc_grpc_request(
                         request
@@ -1422,7 +1408,7 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                             finish_reason=LLMFinishReason.STOP,
                         )
                         yield resp
-                    continue
+                    return
                 else:
                     async for resp, stats in iter_real_model_stream_infer(
                         request,
@@ -1460,7 +1446,7 @@ class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                             prompt_cached_token_num=prompt_cached_token_num,
                         )
                         yield resp
-                    continue
+                    return
             if first_request:
                 record.mark_request_done("eof")
         except BaseException as e:

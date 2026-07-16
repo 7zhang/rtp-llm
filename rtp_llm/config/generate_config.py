@@ -1,5 +1,6 @@
 import copy
 import hashlib
+import json
 import logging
 import time
 from typing import Any, Dict, List, Optional, Union
@@ -75,6 +76,25 @@ def _reset_sanitize_warn_state():
     global _last_sanitize_warn_time, _last_downgrade_warn_time
     _last_sanitize_warn_time = 0.0
     _last_downgrade_warn_time = 0.0
+
+
+def _is_plain_text_response_format(value: Any) -> bool:
+    """Return whether ``response_format`` explicitly requests normal text.
+
+    OpenAI-compatible clients may send ``{"type": "text"}`` even though text
+    is already the default. It is a compatibility sentinel, not a structured
+    output request, and therefore needs no backend transport.
+    """
+    parsed = value
+    if isinstance(parsed, str):
+        stripped = parsed.strip()
+        if stripped == "text":
+            return True
+        try:
+            parsed = json.loads(stripped)
+        except (TypeError, ValueError):
+            return False
+    return isinstance(parsed, dict) and parsed == {"type": "text"}
 
 
 class GenerateConfig(BaseModel):
@@ -698,8 +718,11 @@ class GenerateConfig(BaseModel):
         controls: List[str] = []
         if self.json_format:
             controls.append("json_format")
+        if self.response_format is not None and not _is_plain_text_response_format(
+            self.response_format
+        ):
+            controls.append("response_format")
         for name in (
-            "response_format",
             "json_schema",
             "regex",
             "ebnf",
