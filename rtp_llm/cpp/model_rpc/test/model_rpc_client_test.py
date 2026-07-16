@@ -38,7 +38,11 @@ from rtp_llm.cpp.model_rpc.proto.model_rpc_service_pb2 import (
     GenerateOutputsPB,
     TensorPB,
 )
-from rtp_llm.utils.base_model_datatypes import GenerateInput, GenerateOutputs, RequestInfo
+from rtp_llm.utils.base_model_datatypes import (
+    GenerateInput,
+    GenerateOutputs,
+    RequestInfo,
+)
 
 
 class FakeStub:
@@ -87,9 +91,9 @@ class FakeModelRpcClient(ModelRpcClient):
     def __init__(self):
         # Call parent __init__ with minimal required parameters
         super().__init__(
-            [],     # addresses: empty list for fake client
-            {},     # client_config: empty dict for fake client
-            0,      # max_rpc_timeout_ms
+            [],  # addresses: empty list for fake client
+            {},  # client_config: empty dict for fake client
+            0,  # max_rpc_timeout_ms
             False,  # decode_entrance
         )
         self.stub = FakeStub()
@@ -180,6 +184,28 @@ class ModelRpcClientTest(TestCase):
         logits_2 = res[2].logits.tolist()
         self.assertAlmostEqual(logits_2[0][0], 0.0, places=6)
         self.assertAlmostEqual(logits_2[0][1], 0.0, places=6)
+
+    def test_trans_output_empty_terminal_output_ids(self):
+        input_py = GenerateInput(
+            token_ids=torch.tensor([1, 2, 3]),
+            generate_config=GenerateConfig(),
+            request_id=123,
+            mm_inputs=[],
+        )
+        outputs_pb = GenerateOutputsPB()
+        flatten_output = outputs_pb.flatten_output
+        flatten_output.output_ids.data_type = TensorPB.DataType.INT32
+        flatten_output.output_ids.shape.extend([1, 1, 0])
+        flatten_output.finished.append(True)
+
+        result = trans_output(input_py, outputs_pb, StreamState())
+
+        self.assertEqual(len(result.generate_outputs), 1)
+        output = result.generate_outputs[0]
+        self.assertTrue(output.finished)
+        self.assertEqual(output.output_ids.dtype, torch.int32)
+        self.assertEqual(list(output.output_ids.shape), [1, 0])
+        self.assertEqual(output.output_ids.numel(), 0)
 
     def test_trans_input_request_info(self):
         input_pb = trans_input(

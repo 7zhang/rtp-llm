@@ -48,6 +48,128 @@ from rtp_llm.utils.word_util import (
     truncate_response_with_stop_words,
 )
 
+_OPTIONAL_OUTPUT_FIELDS = (
+    "hidden_states",
+    "all_hidden_states",
+    "input_ids",
+    "loss",
+    "logits",
+    "all_probs",
+)
+_AUX_LATEST_FIELDS = ("cum_log_probs",)
+
+
+def _latest_choice_value(
+    outputs_list: List[GenerateOutputs],
+    choice_index: int,
+    field_name: str,
+    *,
+    from_aux_info: bool = False,
+    require_non_empty: bool = False,
+) -> Any:
+    for outputs in reversed(outputs_list):
+        if choice_index >= len(outputs.generate_outputs):
+            continue
+        output = outputs.generate_outputs[choice_index]
+        source = output.aux_info if from_aux_info else output
+        if source is None:
+            continue
+        value = getattr(source, field_name)
+        if value is None or (require_non_empty and not value):
+            continue
+        return value
+    return None
+
+
+def _backfill_merged_output_metadata(
+    merged_output: GenerateOutput,
+    previous_outputs: List[GenerateOutputs],
+    choice_index: int,
+) -> set[str]:
+    backfilled_fields: set[str] = set()
+    for field_name in _OPTIONAL_OUTPUT_FIELDS:
+        if getattr(merged_output, field_name) is not None:
+            continue
+        value = _latest_choice_value(previous_outputs, choice_index, field_name)
+        if value is not None:
+            setattr(merged_output, field_name, copy.deepcopy(value))
+            backfilled_fields.add(field_name)
+
+    if merged_output.aux_info is None:
+        return backfilled_fields
+    for field_name in _AUX_LATEST_FIELDS:
+        if getattr(merged_output.aux_info, field_name):
+            continue
+        value = _latest_choice_value(
+            previous_outputs,
+            choice_index,
+            field_name,
+            from_aux_info=True,
+            require_non_empty=True,
+        )
+        if value is not None:
+            setattr(merged_output.aux_info, field_name, copy.deepcopy(value))
+
+    return backfilled_fields
+
+
+def _is_state_only_terminal(output: GenerateOutput) -> bool:
+    return bool(
+        output.finished
+        and output.output_ids is not None
+        and output.output_ids.numel() == 0
+        and output.aux_info is not None
+        and output.aux_info.step_output_len == 0
+    )
+
+
+def _merge_choice_softmax_probs(
+    outputs_list: List[GenerateOutputs],
+    choice_index: int,
+    final_output: GenerateOutput,
+) -> Optional[List[float]]:
+    if final_output.aux_info is None:
+        return None
+
+    is_state_only_terminal = _is_state_only_terminal(final_output)
+    if is_state_only_terminal and final_output.aux_info.softmax_probs:
+        return copy.deepcopy(final_output.aux_info.softmax_probs)
+
+    source_outputs = outputs_list[:-1] if is_state_only_terminal else outputs_list
+    merged_softmax_probs: List[float] = []
+    for outputs in source_outputs:
+        if choice_index >= len(outputs.generate_outputs):
+            continue
+        output = outputs.generate_outputs[choice_index]
+        if output.aux_info is None or not output.aux_info.softmax_probs:
+            continue
+        merged_softmax_probs.extend(output.aux_info.softmax_probs)
+
+    return merged_softmax_probs or None
+
+
+def _postprocess_backfilled_hidden_states(
+    merged_output: GenerateOutput,
+    generate_config: Optional[GenerateConfig],
+    backfilled_fields: set[str],
+    is_state_only_terminal: bool,
+) -> None:
+    if (
+        generate_config is None
+        or "hidden_states" not in backfilled_fields
+        or not is_state_only_terminal
+        or merged_output.hidden_states is None
+        or not generate_config.return_hidden_states
+    ):
+        return
+
+    hidden_states = merged_output.hidden_states
+    if generate_config.hidden_states_cut_dim > 0:
+        hidden_states = hidden_states[:, : generate_config.hidden_states_cut_dim]
+    if generate_config.normalized_hidden_states:
+        hidden_states = torch.nn.functional.normalize(hidden_states, p=2, dim=-1)
+    merged_output.hidden_states = hidden_states.cpu().clone()
+
 
 def _get_think_config(generate_env_config):
     """Get thinking configuration from generate_env_config.
@@ -437,7 +559,9 @@ class CustomChatRenderer:
 
         # 处理非流式请求的合并逻辑
         if not generate_config.is_streaming:
-            output_generator = await self._merge_non_streaming_outputs(output_generator)
+            output_generator = await self._merge_non_streaming_outputs(
+                output_generator, generate_config
+            )
 
         async for response in self.render_response_stream(
             output_generator, request, generate_config
@@ -445,13 +569,16 @@ class CustomChatRenderer:
             yield response
 
     async def _merge_non_streaming_outputs(
-        self, output_generator: AsyncGenerator[GenerateOutputs, None]
+        self,
+        output_generator: AsyncGenerator[GenerateOutputs, None],
+        generate_config: GenerateConfig,
     ) -> AsyncGenerator[GenerateOutputs, None]:
         """
         合并非流式请求的多个输出为单个输出
 
         Args:
             output_generator: 原始的输出生成器
+            generate_config: 当前请求的生成配置
 
         Returns:
             包含单个合并输出的新生成器
@@ -462,7 +589,7 @@ class CustomChatRenderer:
             collected_outputs.append(output)
 
         # 合并输出
-        merged_output = self._merge_generate_outputs(collected_outputs)
+        merged_output = self._merge_generate_outputs(collected_outputs, generate_config)
 
         # 创建新的单次输出generator
         async def single_output_generator():
@@ -471,7 +598,9 @@ class CustomChatRenderer:
         return single_output_generator()
 
     def _merge_generate_outputs(
-        self, collected_outputs_list: List[GenerateOutputs]
+        self,
+        collected_outputs_list: List[GenerateOutputs],
+        generate_config: Optional[GenerateConfig] = None,
     ) -> GenerateOutputs:
         """
         合并多个GenerateOutputs为单个GenerateOutputs
@@ -495,6 +624,8 @@ class CustomChatRenderer:
         # 对每个choice/beam分别处理
         merged_generate_outputs = []
         for i, final_output in enumerate(final_outputs.generate_outputs):
+            is_state_only_terminal = _is_state_only_terminal(final_output)
+
             # 收集这个choice在所有GenerateOutputs中的output_ids
             all_output_ids = []
             for outputs in collected_outputs_list:
@@ -512,6 +643,27 @@ class CustomChatRenderer:
             # 深拷贝final_output并只替换output_ids
             merged_output = copy.deepcopy(final_output)
             merged_output.output_ids = merged_output_ids
+
+            # A state-only terminal may omit optional payloads. Preserve its
+            # final status/aux counters while recovering the latest available
+            # values from preceding data frames.
+            backfilled_fields: set[str] = set()
+            if is_state_only_terminal:
+                backfilled_fields = _backfill_merged_output_metadata(
+                    merged_output, collected_outputs_list[:-1], i
+                )
+            if merged_output.aux_info is not None:
+                merged_softmax_probs = _merge_choice_softmax_probs(
+                    collected_outputs_list, i, final_output
+                )
+                if merged_softmax_probs is not None:
+                    merged_output.aux_info.softmax_probs = merged_softmax_probs
+            _postprocess_backfilled_hidden_states(
+                merged_output,
+                generate_config,
+                backfilled_fields,
+                is_state_only_terminal,
+            )
 
             merged_generate_outputs.append(merged_output)
 

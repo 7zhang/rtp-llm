@@ -36,8 +36,10 @@ GenerateOutputs NormalGenerateStream::prepareGenerateOutput(const StreamUpdateIn
         generate_output.output_ids          = torch::empty({1, (int64_t)output_len}, torch::kInt32);
 
         // TODO(xinfei.sxf) optimize this copy : only copy last token
-        complete_token_ids_->copyTokensTo(
-            i, generate_output.output_ids.data_ptr<int32_t>(), last_output_pos_, output_len);
+        if (output_len > 0) {
+            complete_token_ids_->copyTokensTo(
+                i, generate_output.output_ids.data_ptr<int32_t>(), last_output_pos_, output_len);
+        }
         if (returnLogits() && update_info.logits.defined()) {
             torch::Tensor logits_result;
             const auto&   select_tokens_id = generate_input_->generate_config->select_tokens_id;
@@ -173,7 +175,8 @@ void NormalGenerateStream::updateOutput(const StreamUpdateInfo& update_info) {
         setSoftmaxProbs(update_info.softmax_probs, seqLength() - update_info.num_new_tokens);
     }
 
-    finished_ = needFinish();
+    const bool was_finished = finished_;
+    finished_               = needFinish();
     if (finished_) {
         reportEventWithoutLock(StreamEvents::GenerateDone);
         fillSubGenerateStatus(StreamState::FINISHED);
@@ -209,7 +212,9 @@ void NormalGenerateStream::updateOutput(const StreamUpdateInfo& update_info) {
         return;
     }
 
-    if (seqLength() - last_output_pos_ == 0) {
+    // A dynamic token cap can become satisfied after the previous packet was
+    // emitted. Preserve the first finished transition even when it adds no token.
+    if (seqLength() == last_output_pos_ && (!finished_ || was_finished)) {
         return;
     }
 

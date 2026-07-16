@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, Mock
 
 import torch
 
+from rtp_llm.config.generate_config import GenerateConfig
 from rtp_llm.config.py_config_modules import GenerateEnvConfig
 from rtp_llm.openai.api_datatype import (
     ChatCompletionRequest,
@@ -19,7 +20,7 @@ from rtp_llm.openai.renderers.custom_renderer import (
 from rtp_llm.openai.renderers.reasoning_tool_base_renderer import (
     ReasoningToolBaseRenderer,
 )
-from rtp_llm.utils.base_model_datatypes import AuxInfo, GenerateOutput
+from rtp_llm.utils.base_model_datatypes import AuxInfo, GenerateOutput, GenerateOutputs
 from rtp_llm.utils.word_util import get_stop_word_slices
 
 
@@ -155,6 +156,185 @@ class RemoveStopWordIdsTest(TestCase):
         output_ids = [100, 300, 301, 102]
         result = self.renderer._remove_stop_word_ids(output_ids, [])
         self.assertEqual(result, [100])
+
+
+class MergeGenerateOutputsTest(TestCase):
+    def test_empty_terminal_preserves_latest_nonempty_output_metadata(self):
+        renderer = CustomChatRenderer.__new__(CustomChatRenderer)
+        token_aux = AuxInfo(
+            output_len=2,
+            step_output_len=2,
+            cum_log_probs=[-0.25],
+            softmax_probs=[0.2, 0.8],
+        )
+        terminal_aux = AuxInfo(output_len=2, step_output_len=0)
+        token_output = GenerateOutput(
+            output_ids=torch.tensor([[10, 11]], dtype=torch.int32),
+            hidden_states=torch.tensor([[1.0, 2.0]]),
+            all_hidden_states=torch.tensor([[[3.0, 4.0]]]),
+            logits=torch.tensor([[0.1, 0.9]]),
+            loss=torch.tensor([0.5]),
+            all_probs=torch.tensor([[0.25, 0.75]]),
+            aux_info=token_aux,
+            finished=False,
+        )
+        terminal_output = GenerateOutput(
+            output_ids=torch.empty((1, 0), dtype=torch.int32),
+            aux_info=terminal_aux,
+            finished=True,
+        )
+
+        merged = renderer._merge_generate_outputs(
+            [
+                GenerateOutputs(generate_outputs=[token_output]),
+                GenerateOutputs(generate_outputs=[terminal_output]),
+            ]
+        ).generate_outputs[0]
+
+        self.assertEqual(merged.output_ids.tolist(), [[10, 11]])
+        self.assertTrue(merged.finished)
+        self.assertEqual(merged.aux_info.output_len, 2)
+        self.assertEqual(merged.aux_info.step_output_len, 0)
+        self.assertEqual(merged.aux_info.cum_log_probs, [-0.25])
+        self.assertEqual(merged.aux_info.softmax_probs, [0.2, 0.8])
+        self.assertTrue(torch.equal(merged.hidden_states, token_output.hidden_states))
+        self.assertTrue(
+            torch.equal(merged.all_hidden_states, token_output.all_hidden_states)
+        )
+        self.assertTrue(torch.equal(merged.logits, token_output.logits))
+        self.assertTrue(torch.equal(merged.loss, token_output.loss))
+        self.assertTrue(torch.equal(merged.all_probs, token_output.all_probs))
+
+    def test_empty_terminal_concatenates_softmax_and_keeps_latest_cumulative(self):
+        renderer = CustomChatRenderer.__new__(CustomChatRenderer)
+        first_output = GenerateOutput(
+            output_ids=torch.tensor([[10]], dtype=torch.int32),
+            aux_info=AuxInfo(
+                output_len=1,
+                step_output_len=1,
+                cum_log_probs=[-0.5],
+                softmax_probs=[0.1],
+            ),
+            finished=False,
+        )
+        second_output = GenerateOutput(
+            output_ids=torch.tensor([[11]], dtype=torch.int32),
+            aux_info=AuxInfo(
+                output_len=2,
+                step_output_len=1,
+                cum_log_probs=[-0.25],
+                softmax_probs=[0.2],
+            ),
+            finished=False,
+        )
+        terminal_output = GenerateOutput(
+            output_ids=torch.empty((1, 0), dtype=torch.int32),
+            aux_info=AuxInfo(output_len=2, step_output_len=0),
+            finished=True,
+        )
+
+        merged = renderer._merge_generate_outputs(
+            [
+                GenerateOutputs(generate_outputs=[first_output]),
+                GenerateOutputs(generate_outputs=[second_output]),
+                GenerateOutputs(generate_outputs=[terminal_output]),
+            ]
+        ).generate_outputs[0]
+
+        self.assertEqual(merged.output_ids.tolist(), [[10, 11]])
+        self.assertEqual(merged.aux_info.softmax_probs, [0.1, 0.2])
+        self.assertEqual(merged.aux_info.cum_log_probs, [-0.25])
+
+    def test_empty_terminal_postprocesses_backfilled_hidden_states(self):
+        renderer = CustomChatRenderer.__new__(CustomChatRenderer)
+        token_output = GenerateOutput(
+            output_ids=torch.tensor([[10]], dtype=torch.int32),
+            hidden_states=torch.tensor([[3.0, 4.0, 100.0]]),
+            aux_info=AuxInfo(output_len=1, step_output_len=1),
+            finished=False,
+        )
+        terminal_output = GenerateOutput(
+            output_ids=torch.empty((1, 0), dtype=torch.int32),
+            aux_info=AuxInfo(output_len=1, step_output_len=0),
+            finished=True,
+        )
+        generate_config = GenerateConfig(
+            return_hidden_states=True,
+            hidden_states_cut_dim=2,
+            normalized_hidden_states=True,
+        )
+
+        merged = renderer._merge_generate_outputs(
+            [
+                GenerateOutputs(generate_outputs=[token_output]),
+                GenerateOutputs(generate_outputs=[terminal_output]),
+            ],
+            generate_config,
+        ).generate_outputs[0]
+
+        self.assertTrue(
+            torch.allclose(
+                merged.hidden_states,
+                torch.tensor([[0.6, 0.8]]),
+                atol=1e-6,
+            )
+        )
+
+    def test_empty_terminal_keeps_its_own_hidden_and_softmax_payloads(self):
+        renderer = CustomChatRenderer.__new__(CustomChatRenderer)
+        token_output = GenerateOutput(
+            output_ids=torch.tensor([[10]], dtype=torch.int32),
+            hidden_states=torch.tensor([[3.0, 4.0]]),
+            aux_info=AuxInfo(output_len=1, step_output_len=1, softmax_probs=[0.1]),
+            finished=False,
+        )
+        terminal_output = GenerateOutput(
+            output_ids=torch.empty((1, 0), dtype=torch.int32),
+            hidden_states=torch.tensor([[9.0, 12.0]]),
+            aux_info=AuxInfo(output_len=1, step_output_len=0, softmax_probs=[0.9]),
+            finished=True,
+        )
+        generate_config = GenerateConfig(
+            return_hidden_states=True,
+            normalized_hidden_states=True,
+        )
+
+        merged = renderer._merge_generate_outputs(
+            [
+                GenerateOutputs(generate_outputs=[token_output]),
+                GenerateOutputs(generate_outputs=[terminal_output]),
+            ],
+            generate_config,
+        ).generate_outputs[0]
+
+        self.assertTrue(
+            torch.equal(merged.hidden_states, terminal_output.hidden_states)
+        )
+        self.assertEqual(merged.aux_info.softmax_probs, [0.9])
+
+    def test_token_terminal_does_not_backfill_optional_payloads(self):
+        renderer = CustomChatRenderer.__new__(CustomChatRenderer)
+        first_output = GenerateOutput(
+            output_ids=torch.tensor([[10]], dtype=torch.int32),
+            hidden_states=torch.tensor([[3.0, 4.0]]),
+            aux_info=AuxInfo(output_len=1, step_output_len=1),
+            finished=False,
+        )
+        terminal_output = GenerateOutput(
+            output_ids=torch.tensor([[11]], dtype=torch.int32),
+            aux_info=AuxInfo(output_len=2, step_output_len=1),
+            finished=True,
+        )
+
+        merged = renderer._merge_generate_outputs(
+            [
+                GenerateOutputs(generate_outputs=[first_output]),
+                GenerateOutputs(generate_outputs=[terminal_output]),
+            ]
+        ).generate_outputs[0]
+
+        self.assertEqual(merged.output_ids.tolist(), [[10, 11]])
+        self.assertIsNone(merged.hidden_states)
 
 
 class ProcessStopWordsTest(TestCase):

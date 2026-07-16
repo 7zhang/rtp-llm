@@ -847,6 +847,27 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info) {
         return;
     }
 
+    // CompleteTokenIds clamps by value, so derive the accepted prefix from
+    // the sequence itself before publishing any next-step speculative state.
+    const int appended_num_new_tokens = std::max(0, seqLength() - old_seq_length);
+    if (appended_num_new_tokens == 0) {
+        updateOutput({new_tokens,
+                      0,
+                      torch::Tensor(),
+                      torch::Tensor(),
+                      torch::Tensor(),
+                      torch::Tensor(),
+                      torch::Tensor(),
+                      torch::Tensor(),
+                      torch::Tensor(),
+                      torch::Tensor(),
+                      update_info.update_remote_generate,
+                      update_info.force_update_info});
+        validateStatefulLogitsProcessorState();
+        return;
+    }
+    num_new_tokens = appended_num_new_tokens;
+
     // update speculative output buffer
     int  target_last_token = new_tokens.data_ptr<int>()[num_new_tokens - 1];
     int* spec_tokens       = sp_output_buffer_->tokens.data_ptr<int>();

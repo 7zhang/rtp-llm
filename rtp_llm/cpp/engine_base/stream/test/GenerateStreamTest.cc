@@ -124,7 +124,7 @@ TEST_F(GenerateStreamTest, testMaxTokenNumExcludesThinkingTokens) {
     config->end_think_token_ids   = {8, 9};
     auto stream                   = builder.createContextStream({1, 2}, config);
 
-    ASSERT_EQ(stream->maxTokenNum(), 7);
+    ASSERT_EQ(stream->maxTokenNum(), 8);
 
     auto processors = stream->getAllLogitsProcessorPtr();
     ASSERT_FALSE(processors.empty());
@@ -134,6 +134,120 @@ TEST_F(GenerateStreamTest, testMaxTokenNumExcludesThinkingTokens) {
     think_processor->updateStatus(torch::tensor({{8, 9}}, torch::kInt32), 2);
     ASSERT_EQ(think_processor->finishedThinkOutputLen(), 2);
     ASSERT_EQ(stream->maxTokenNum(), 5);
+}
+
+TEST_F(GenerateStreamTest, testSpecUpdateZeroCommitEnqueuesTerminalOutput) {
+    autil::EnvGuard guard("RTP_LLM_MAX_TOKENS_EXCLUDE_THINKING", "true");
+    auto            builder       = GenerateStreamBuilder();
+    auto            config        = std::make_shared<GenerateConfig>();
+    config->max_new_tokens        = 1;
+    config->is_streaming          = true;
+    config->in_think_mode         = true;
+    config->max_thinking_tokens   = 5;
+    config->begin_think_token_ids = {7};
+    config->end_think_token_ids   = {8, 9};
+    auto stream                   = builder.createContextStream({1, 2}, config);
+    auto sp_buffer                = std::make_shared<SpeculativeExecutorStreamOutput>();
+    sp_buffer->tokens             = torch::tensor({{42, 99}}, torch::kInt32);
+    sp_buffer->hidden_states      = torch::tensor({{1.0f}});
+    sp_buffer->all_probs          = torch::tensor({{2.0f}});
+    stream->setSPOutputBuffer(sp_buffer);
+
+    // The boundary packet is emitted before the think processor publishes its
+    // shorter, observed thinking length.
+    const int32_t boundary_tokens[] = {8, 9, 42};
+    auto          complete_ids      = stream->completeTokenIds();
+    std::memcpy(complete_ids.data_ptr<int32_t>() + stream->seqLength(), boundary_tokens, sizeof(boundary_tokens));
+    stream->setSeqLength(stream->seqLength() + 3);
+    stream->updateOutput(StreamUpdateInfo{});
+
+    auto processors = stream->getAllLogitsProcessorPtr();
+    ASSERT_FALSE(processors.empty());
+    auto think_processor = std::dynamic_pointer_cast<ThinkModeLogitsProcessor>(processors[0]);
+    ASSERT_NE(think_processor, nullptr);
+    think_processor->updateStatus(torch::tensor({{8, 9, 42}}, torch::kInt32), 3);
+
+    ASSERT_EQ(stream->seqLength(), 5);
+    ASSERT_EQ(stream->maxTokenNum(), 5);
+    ASSERT_TRUE(stream->hasOutput());
+    auto boundary_output = stream->nextOutput();
+    ASSERT_TRUE(boundary_output.ok());
+    ASSERT_EQ(boundary_output.value().generate_outputs.size(), 1);
+    EXPECT_EQ(boundary_output.value().generate_outputs[0].output_ids.numel(), 3);
+    EXPECT_FALSE(boundary_output.value().generate_outputs[0].finished);
+    EXPECT_FALSE(stream->hasOutput());
+
+    auto expected_sp_tokens = sp_buffer->tokens.clone();
+    auto expected_hidden    = sp_buffer->hidden_states.clone();
+    auto expected_probs     = sp_buffer->all_probs.clone();
+
+    // The dynamic cap now equals seqLength(), so CompleteTokenIds commits none
+    // of the proposed tokens. This update must only publish the terminal state.
+    StreamSpecUpdateInfo zero_commit_update{
+        torch::tensor({{50, 51, 52, 53, 54}}, torch::kInt32), 5, 98, torch::tensor({{3.0f}}), torch::tensor({{4.0f}})};
+    stream->specUpdate(zero_commit_update);
+
+    EXPECT_EQ(stream->seqLength(), 5);
+    EXPECT_TRUE(torch::equal(sp_buffer->tokens, expected_sp_tokens));
+    EXPECT_TRUE(torch::equal(sp_buffer->hidden_states, expected_hidden));
+    EXPECT_TRUE(torch::equal(sp_buffer->all_probs, expected_probs));
+    ASSERT_TRUE(stream->hasOutput());
+    auto terminal_output = stream->nextOutput();
+    ASSERT_TRUE(terminal_output.ok());
+    ASSERT_EQ(terminal_output.value().generate_outputs.size(), 1);
+    EXPECT_EQ(terminal_output.value().generate_outputs[0].output_ids.numel(), 0);
+    EXPECT_TRUE(terminal_output.value().generate_outputs[0].finished);
+    EXPECT_FALSE(stream->hasOutput());
+
+    stream->specUpdate(zero_commit_update);
+    EXPECT_FALSE(stream->hasOutput());
+}
+
+TEST_F(GenerateStreamTest, testPdFirstTokenDedupPreservedWithEmptyTerminal) {
+    auto builder = GenerateStreamBuilder();
+
+    // Decode ingests a first token that prefill already published. Advancing
+    // last_output_pos_ before update keeps the token out of the response queue.
+    auto running_config            = std::make_shared<GenerateConfig>();
+    running_config->max_new_tokens = 2;
+    running_config->pd_separation  = true;
+    running_config->is_streaming   = false;
+    auto running_stream            = builder.createContextStream({1, 2}, running_config);
+    running_stream->incLastOutputPos();
+    running_stream->completeTokenIds().data_ptr<int32_t>()[running_stream->seqLength()] = 3;
+    running_stream->setSeqLength(running_stream->seqLength() + 1);
+    StreamUpdateInfo running_update;
+    running_update.update_remote_generate = false;
+    running_stream->updateOutput(running_update);
+
+    EXPECT_EQ(running_stream->seqLength(), 3);
+    EXPECT_FALSE(running_stream->hasOutput());
+
+    // If that already-published token is also the last allowed token, publish
+    // only the terminal state. The token itself must not be emitted twice.
+    auto terminal_config            = std::make_shared<GenerateConfig>();
+    terminal_config->max_new_tokens = 1;
+    terminal_config->pd_separation  = true;
+    terminal_config->is_streaming   = false;
+    auto terminal_stream            = builder.createContextStream({1, 2}, terminal_config);
+    terminal_stream->incLastOutputPos();
+    terminal_stream->completeTokenIds().data_ptr<int32_t>()[terminal_stream->seqLength()] = 3;
+    terminal_stream->setSeqLength(terminal_stream->seqLength() + 1);
+    StreamUpdateInfo terminal_update;
+    terminal_update.update_remote_generate = false;
+    terminal_stream->updateOutput(terminal_update);
+
+    ASSERT_TRUE(terminal_stream->hasOutput());
+    auto terminal_output = terminal_stream->nextOutput();
+    ASSERT_TRUE(terminal_output.ok());
+    ASSERT_EQ(terminal_output.value().generate_outputs.size(), 1);
+    EXPECT_EQ(terminal_output.value().generate_outputs[0].output_ids.numel(), 0);
+    EXPECT_TRUE(terminal_output.value().generate_outputs[0].finished);
+    EXPECT_FALSE(terminal_stream->hasOutput());
+
+    // Re-evaluating the same finished stream must not enqueue another terminal.
+    terminal_stream->updateOutput(terminal_update);
+    EXPECT_FALSE(terminal_stream->hasOutput());
 }
 
 // clearMtpAsyncDeviceState rejects stale epochs. A worker that

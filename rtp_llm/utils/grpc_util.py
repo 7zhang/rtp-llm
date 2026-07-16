@@ -27,18 +27,20 @@ def trans_grpc_dtype(type: TensorPB.DataType):
 
 
 def trans_tensor(t: TensorPB):
-    if not (len(t.shape) > 0 and t.shape[0] > 0):
-        return torch.tensor([], dtype=trans_grpc_dtype(t.data_type))
+    shape = list(t.shape)
+    dtype = trans_grpc_dtype(t.data_type)
+    if 0 in shape:
+        return torch.empty(shape, dtype=dtype)
+    if not (len(shape) > 0 and shape[0] > 0):
+        return torch.tensor([], dtype=dtype)
     if t.data_type == TensorPB.DataType.FP32:
-        return torch.frombuffer(t.fp32_data, dtype=torch.float32).reshape(list(t.shape))
+        return torch.frombuffer(t.fp32_data, dtype=torch.float32).reshape(shape)
     elif t.data_type == TensorPB.DataType.INT32:
-        return torch.frombuffer(t.int32_data, dtype=torch.int32).reshape(list(t.shape))
+        return torch.frombuffer(t.int32_data, dtype=torch.int32).reshape(shape)
     elif t.data_type == TensorPB.DataType.FP16:
-        return torch.frombuffer(t.fp16_data, dtype=torch.float16).reshape(list(t.shape))
+        return torch.frombuffer(t.fp16_data, dtype=torch.float16).reshape(shape)
     elif t.data_type == TensorPB.DataType.BF16:
-        return torch.frombuffer(t.bf16_data, dtype=torch.bfloat16).reshape(
-            list(t.shape)
-        )
+        return torch.frombuffer(t.bf16_data, dtype=torch.bfloat16).reshape(shape)
     else:
         raise Exception("unkown error type")
 
