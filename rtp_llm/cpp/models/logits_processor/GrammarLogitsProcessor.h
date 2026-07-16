@@ -22,7 +22,9 @@ class GrammarLogitsProcessor final:
     public SpecLogitsProcessor,
     public StatefulLogitsProcessor {
 public:
-    explicit GrammarLogitsProcessor(std::shared_ptr<RtpGrammarMatcher> matcher, int64_t eos_token_id = 0);
+    explicit GrammarLogitsProcessor(std::shared_ptr<RtpGrammarMatcher> matcher,
+                                    int64_t                            eos_token_id = 0,
+                                    bool                               replay_each_step = false);
 
     ~GrammarLogitsProcessor() override;
 
@@ -41,10 +43,12 @@ private:
     class DecodeMaskBuilder;
 
     ErrorInfo acceptCommittedLocked(const int32_t* tokens, size_t n);
+    ErrorInfo replayRow(const SamplerInputs& inputs, size_t row, RtpGrammarMatcher& matcher) const;
 
     std::shared_ptr<RtpGrammarMatcher> matcher_;
     int64_t                            eos_token_id_       = 0;
     int64_t                            accepted_token_len_ = 0;
+    bool                               replay_each_step_   = false;
     std::unique_ptr<DecodeMaskBuilder> decode_mask_builder_;
 
     mutable std::mutex state_mutex_;

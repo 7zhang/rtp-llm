@@ -91,11 +91,6 @@ LogitsProcessorFactory::createLogitsProcessors(std::shared_ptr<GenerateInput> ge
     GrammarKeyCpp grammar_key = std::move(grammar_key_result.value());
 
     if (!grammar_key.empty()) {
-        if (config.hasNumBeams() || config.num_return_sequences > 1) {
-            return ErrorInfo(ErrorCode::INVALID_PARAMS,
-                             "grammar-constrained decoding does not support beam search or "
-                             "num_return_sequences > 1");
-        }
         auto& backend = grammarBackend();
         if (!backend) {
             return ErrorInfo(ErrorCode::INVALID_PARAMS,
@@ -116,12 +111,20 @@ LogitsProcessorFactory::createLogitsProcessors(std::shared_ptr<GenerateInput> ge
         if (!matcher_or.ok()) {
             return ErrorInfo(ErrorCode::INVALID_PARAMS, std::string(matcher_or.status().message()));
         }
-        auto grammar_processor =
-            std::make_shared<GrammarLogitsProcessor>(std::move(matcher_or.value()), eos_token_id);
-        result.add(grammar_processor,
-                   /*score_batch=*/nullptr,
-                   /*spec=*/grammar_processor,
-                   /*stateful=*/grammar_processor);
+        const bool replay_each_step = config.hasNumBeams() || config.num_return_sequences > 1;
+        auto grammar_processor = std::make_shared<GrammarLogitsProcessor>(
+            std::move(matcher_or.value()), eos_token_id, replay_each_step);
+        if (replay_each_step) {
+            // MTP/speculative verification has no stable per-beam committed
+            // prefix to replay. Registering only the normal facet makes the
+            // scheduler fall back to ordinary decode for this request.
+            result.add(grammar_processor);
+        } else {
+            result.add(grammar_processor,
+                       /*score_batch=*/nullptr,
+                       /*spec=*/grammar_processor,
+                       /*stateful=*/grammar_processor);
+        }
     }
 
     auto tree_processor = TreeLogitsProcessor::fromGenerateInput(generate_input, init_batch_size);

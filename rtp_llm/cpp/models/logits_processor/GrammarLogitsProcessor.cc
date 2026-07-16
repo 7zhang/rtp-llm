@@ -436,9 +436,12 @@ private:
     int32_t                    reusable_mask_words_ = 0;
 };
 
-GrammarLogitsProcessor::GrammarLogitsProcessor(std::shared_ptr<RtpGrammarMatcher> matcher, int64_t eos_token_id):
+GrammarLogitsProcessor::GrammarLogitsProcessor(std::shared_ptr<RtpGrammarMatcher> matcher,
+                                                int64_t                            eos_token_id,
+                                                bool                               replay_each_step):
     matcher_(std::move(matcher)),
     eos_token_id_(eos_token_id),
+    replay_each_step_(replay_each_step),
     decode_mask_builder_(std::make_unique<DecodeMaskBuilder>()) {}
 
 GrammarLogitsProcessor::~GrammarLogitsProcessor() = default;
@@ -452,8 +455,48 @@ GrammarLogitsProcessor::process(const SamplerInputs& inputs, size_t start_idx, s
     if (batch_size == 0) {
         return std::nullopt;
     }
-    if (batch_size != 1) {
+    if (!replay_each_step_ && batch_size != 1) {
         return ErrorInfo(ErrorCode::INVALID_PARAMS, "grammar logits processor only supports single sequence decoding");
+    }
+    if (replay_each_step_) {
+        if (!inputs.token_ids.defined() || !inputs.input_lengths.defined() || !inputs.sequence_lengths.defined()
+            || inputs.token_ids.dim() != 2 || inputs.token_ids.scalar_type() != torch::kInt32
+            || !inputs.token_ids.is_contiguous()) {
+            return ErrorInfo(ErrorCode::EXECUTION_EXCEPTION,
+                             "grammar replay requires contiguous int32 token_ids and sequence length inputs");
+        }
+        if (finish_idx > static_cast<size_t>(inputs.token_ids.size(0))
+            || finish_idx > static_cast<size_t>(inputs.input_lengths.numel())
+            || finish_idx > static_cast<size_t>(inputs.sequence_lengths.numel())) {
+            return ErrorInfo(ErrorCode::EXECUTION_EXCEPTION,
+                             "grammar replay input rows do not cover the logits processor interval");
+        }
+
+        for (size_t row = start_idx; row < finish_idx; ++row) {
+            if (inputs.finished_mask.defined() && inputs.finished_mask.data_ptr<bool>()[row]) {
+                continue;
+            }
+            auto matcher_or = matcher_->newMatcher();
+            if (!matcher_or.ok()) {
+                return matcher_or.status();
+            }
+            auto replay_error = replayRow(inputs, row, *matcher_or.value());
+            if (replay_error.hasError()) {
+                return replay_error;
+            }
+
+            // Two beams can have equal output lengths but different parser
+            // states, so their mask caches must not be shared.
+            DecodeMaskBuilder row_mask_builder;
+            const int64_t output_len = inputs.sequence_lengths.data_ptr<int32_t>()[row]
+                                     - inputs.input_lengths.data_ptr<int32_t>()[row];
+            auto error =
+                row_mask_builder.apply(inputs.logits[row], *matcher_or.value(), output_len, eos_token_id_);
+            if (error.hasError()) {
+                return error;
+            }
+        }
+        return std::nullopt;
     }
     if (inputs.finished_mask.defined()) {
         const auto* finished = inputs.finished_mask.data_ptr<bool>();
@@ -480,6 +523,11 @@ std::optional<ErrorInfo> GrammarLogitsProcessor::commitTokens(const torch::Tenso
     if (!matcher_) {
         return std::nullopt;
     }
+    if (replay_each_step_) {
+        // Normal decode rebuilds from GenerateStream's authoritative token
+        // history before the next mask, so there is no mutable state to commit.
+        return std::nullopt;
+    }
 
     RTP_LLM_CHECK(new_tokens.dim() == 2);
     RTP_LLM_CHECK(new_tokens.scalar_type() == torch::kInt32);
@@ -500,6 +548,50 @@ std::optional<ErrorInfo> GrammarLogitsProcessor::commitTokens(const torch::Tenso
         return error;
     }
     return std::nullopt;
+}
+
+ErrorInfo GrammarLogitsProcessor::replayRow(const SamplerInputs& inputs,
+                                            size_t               row,
+                                            RtpGrammarMatcher&   matcher) const {
+    const auto* input_lengths    = inputs.input_lengths.data_ptr<int32_t>();
+    const auto* sequence_lengths = inputs.sequence_lengths.data_ptr<int32_t>();
+    const int32_t input_len      = input_lengths[row];
+    const int32_t sequence_len   = sequence_lengths[row];
+    const int64_t token_capacity = inputs.token_ids.size(1);
+    if (input_len < 0 || sequence_len < input_len || sequence_len > token_capacity) {
+        return ErrorInfo(ErrorCode::EXECUTION_EXCEPTION,
+                         "grammar replay received invalid token bounds for row " + std::to_string(row)
+                             + " (input_len=" + std::to_string(input_len)
+                             + ", sequence_len=" + std::to_string(sequence_len)
+                             + ", capacity=" + std::to_string(token_capacity) + ")");
+    }
+
+    const auto* tokens = inputs.token_ids.data_ptr<int32_t>() + row * token_capacity + input_len;
+    for (int32_t offset = 0; offset < sequence_len - input_len; ++offset) {
+        const int32_t token = tokens[offset];
+        auto terminated = matcher.isTerminated();
+        if (!terminated.ok()) {
+            return terminated.status();
+        }
+        if (terminated.value()) {
+            if (token == static_cast<int32_t>(eos_token_id_)) {
+                return ErrorInfo::OkStatus();
+            }
+            return ErrorInfo(ErrorCode::GRAMMAR_NON_EOS_AFTER_TERMINAL,
+                             "grammar replay received non-EOS token after terminal state at row "
+                                 + std::to_string(row));
+        }
+        auto accepted = matcher.acceptToken(token);
+        if (!accepted.ok()) {
+            return accepted.status();
+        }
+        if (!accepted.value()) {
+            return ErrorInfo(ErrorCode::GRAMMAR_PARSER_REJECTED_TOKEN,
+                             "grammar replay rejected token " + std::to_string(token)
+                                 + " at row " + std::to_string(row));
+        }
+    }
+    return ErrorInfo::OkStatus();
 }
 
 ErrorResult<int> GrammarLogitsProcessor::tryAcceptAndFillBitmask(const SpecLogitsProcessorRequest& request) {

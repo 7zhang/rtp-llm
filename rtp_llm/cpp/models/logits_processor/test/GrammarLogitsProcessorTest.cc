@@ -129,6 +129,8 @@ std::string makeReasoningStructuralTagWithTokenEnd(int budget, int end_token_id)
 
 constexpr int kA   = 'a';  // token id 97
 constexpr int kB   = 'b';  // token id 98
+constexpr int kC   = 'c';  // token id 99
+constexpr int kD   = 'd';  // token id 100
 constexpr int kX   = 'x';  // token id 120
 constexpr int kEos = 0;    // stop token in makeAsciiTokenizerInfo
 constexpr int kZ   = 'z';  // structural-tag think end in makeReasoningStructuralTag
@@ -153,6 +155,31 @@ TEST(GrammarLogitsProcessorTest, ProcessMasksInitialDecodeState) {
     expectTokenMasked(values, kB);
     expectTokenMasked(values, kX);
     EXPECT_FALSE(error.has_value());
+}
+
+TEST(GrammarLogitsProcessorTest, ReplayModeRebuildsIndependentBeamStates) {
+    XGrammarBackend backend(makeAsciiTokenizerInfo(), defaultOptions());
+    auto            template_proc = makeProcessor(backend, "ab|cd");
+    auto replay_proc =
+        std::make_shared<GrammarLogitsProcessor>(template_proc.matcher, kEos, /*replay_each_step=*/true);
+
+    auto inputs = makeSamplerInputs(torch::zeros({2, 128}, torch::kFloat32));
+    // Prompt tokens intentionally differ and are ignored. The output prefixes
+    // select different parser branches for the two beams.
+    inputs.token_ids = torch::tensor({{17, kA, 0}, {23, kC, 0}}, torch::kInt32).contiguous();
+    inputs.input_lengths = torch::tensor({1, 1}, torch::kInt32);
+    inputs.sequence_lengths = torch::tensor({2, 2}, torch::kInt32);
+
+    auto error = replay_proc->process(inputs, 0, 2);
+    ASSERT_FALSE(error.has_value());
+
+    auto beam_a = logitsVec(inputs.logits[0]);
+    expectTokenAllowed(beam_a, kB);
+    expectTokenMasked(beam_a, kD);
+
+    auto beam_c = logitsVec(inputs.logits[1]);
+    expectTokenMasked(beam_c, kB);
+    expectTokenAllowed(beam_c, kD);
 }
 
 TEST(GrammarLogitsProcessorTest, UpdateStatusAdvancesDecodeMaskState) {
