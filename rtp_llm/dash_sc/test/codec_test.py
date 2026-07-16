@@ -805,6 +805,17 @@ class DashScGrpcRequestTest(TestCase):
         self.assertEqual(sp.stop_words_list, ((1, 2), (3, 4)))
         self.assertEqual(sp.stop_words_list_py(), [[1, 2], [3, 4]])
 
+    def test_client_rejects_request_level_stop_words(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "request-level stop_words_list is unsupported"
+        ):
+            build_model_infer_request(
+                request_id="test",
+                model_name="default",
+                input_ids=[1, 2],
+                sampling=SamplingParams(stop_words_list=((1,), (2, 3))),
+            )
+
     def test_sampling_params_n_alias(self) -> None:
         sp = SamplingParams(num_return_sequences=5)
         self.assertEqual(sp.n, 5)

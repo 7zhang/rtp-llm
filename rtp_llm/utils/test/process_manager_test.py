@@ -1026,6 +1026,43 @@ class TestFailureShutdownPaths(unittest.TestCase):
 
         self.assertEqual(signals, [(123456, signal.SIGINT)])
 
+    def test_failure_shutdown_sends_sigint_to_deferred_backend_group(self):
+        """A frontend/DashSc crash must wake the nested backend manager.
+
+        The backend manager deliberately defers its first SIGTERM, so failure
+        shutdown uses the explicit SIGINT handoff for that direct child while
+        ordinary frontend children still receive SIGTERM.
+        """
+
+        class FakeProcess:
+            _popen = object()
+
+            def __init__(self, name, pid):
+                self.name = name
+                self.pid = pid
+
+            def is_alive(self):
+                return True
+
+        frontend = FakeProcess("frontend", 123456)
+        backend = FakeProcess("backend", 123457)
+        self.manager.add_process(frontend, shutdown_group="frontend")
+        self.manager.add_process(backend, shutdown_group="backend")
+
+        signals = []
+        with patch(
+            "os.kill", side_effect=lambda pid, sig: signals.append((pid, sig))
+        ):
+            self.manager._terminate_processes(drain_timeout=0, staged=False)
+
+        self.assertEqual(
+            signals,
+            [
+                (frontend.pid, signal.SIGTERM),
+                (backend.pid, signal.SIGINT),
+            ],
+        )
+
     def test_backend_shutdown_lingers_after_frontend_drain(self):
         events = []
 

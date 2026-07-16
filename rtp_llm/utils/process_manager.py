@@ -331,7 +331,11 @@ class ProcessManager:
           Phase 2 — SIGTERM deferred groups (backend), then wait for remaining
                     managed processes before the monitor's last-resort SIGKILL.
 
-        Non-staged mode (post-crash all-stop): SIGTERM everyone at once.
+        Non-staged mode (post-crash all-stop): SIGTERM ordinary children at
+        once, but SIGINT deferred groups.  A backend manager intentionally
+        defers its first SIGTERM to tolerate cgroup-wide shutdown noise; using
+        SIGINT here is the explicit parent-to-backend shutdown handoff so it
+        can begin reaping its rank children before the outer manager escalates.
         """
         logging.info(f"Sending SIGTERM (drain_timeout={drain_timeout}s)")
         self._used_pre_stop_drain_signal = False
@@ -357,9 +361,19 @@ class ProcessManager:
                     "managed",
                 )
         else:
-            self._terminate_process_list(
-                self.processes, "managed", force_immediate=self._defer_first_sigterm
-            )
+            for group_name in self.shutdown_group_order:
+                self._terminate_process_list(
+                    self.process_groups.get(group_name, []),
+                    group_name,
+                    force_immediate=(
+                        self._defer_first_sigterm and group_name == "default"
+                    ),
+                    signum=(
+                        signal.SIGINT
+                        if group_name in self.DEFERRED_GROUPS
+                        else signal.SIGTERM
+                    ),
+                )
             self._wait_process_list_exit(
                 self.processes,
                 self._remaining_timeout(drain_deadline),
