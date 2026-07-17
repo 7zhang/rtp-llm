@@ -52,9 +52,8 @@ from rtp_llm.dash_sc.grpc_metrics import (
     report_chunk,
     report_frontend_rpc_done,
 )
-from rtp_llm.dash_sc.proto import predict_v2_pb2
+from rtp_llm.dash_sc.proto import predict_v2_pb2, predict_v2_pb2_grpc
 from rtp_llm.dash_sc.repetition_monitor import RequestRepetitionMonitorConfig
-from rtp_llm.dash_sc.servicer_base import DashScHealthState, DashScServicerBase
 from rtp_llm.frontend.request_id_generator import generate_request_id
 from rtp_llm.metrics import AccMetrics, kmonitor
 from rtp_llm.server.request_headers import (
@@ -1130,7 +1129,9 @@ async def iter_real_model_stream_infer(
 # ----------------------------------------------------------------------------
 
 
-class DashScInferenceServicer(DashScServicerBase):
+# TODO: Implement ServerLive, ServerReady, and ModelReady after the DashSc
+# health-check contract is defined. The generated base returns UNIMPLEMENTED.
+class DashScInferenceServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
     """ModelStreamInfer: fake mode (mock) or real mode (``backend_visitor.enqueue``).
 
     ``ip`` / ``port`` / ``server_id`` derive the snowflake-style ``GenerateInput.request_id``
@@ -1154,10 +1155,8 @@ class DashScInferenceServicer(DashScServicerBase):
         think_runtime: Optional[_ThinkRuntime] = None,
         rank_id: Optional[int] = None,
         repetition_monitor_config: Optional[RequestRepetitionMonitorConfig] = None,
-        health_state: Optional[DashScHealthState] = None,
         max_seq_len: Optional[int] = None,
     ):
-        super().__init__(health_state)
         self._backend_visitor = backend_visitor
         self._ip = ip
         self._port = port
@@ -1332,10 +1331,12 @@ class DashScInferenceServicer(DashScServicerBase):
                     )
                     yield resp
                     return
+                # max_new_tokens is a ceiling; the engine caps total sequence
+                # length at max_seq_len. Reject only when no output slot remains.
                 if (
                     self._max_seq_len is not None
-                    and len(input_ids_list) + sampling.max_new_tokens
-                    > self._max_seq_len
+                    and sampling.max_new_tokens > 0
+                    and len(input_ids_list) >= self._max_seq_len
                 ):
                     error_spec = DASH_ERROR_TOO_LONG
                     resp = build_dash_error_response(

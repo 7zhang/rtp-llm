@@ -32,7 +32,6 @@ py_library(
         "proxy/servicer.py",
         "repetition_monitor.py",
         "server.py",
-        "servicer_base.py",
         "status.py",
         "structural_tag.py",
         "think.py",

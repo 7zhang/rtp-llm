@@ -25,6 +25,7 @@ from rtp_llm.dash_sc.access_log import (
 )
 from rtp_llm.dash_sc.proto import predict_v2_pb2_grpc
 from rtp_llm.dash_sc.proxy.servicer import DashScProxyServicer
+from rtp_llm.server.server_args.grpc_group_args import default_dash_sc_grpc_config_json
 
 
 def _resolve_dash_sc_grpc_config(dash_sc_grpc_config):
@@ -32,7 +33,9 @@ def _resolve_dash_sc_grpc_config(dash_sc_grpc_config):
         return dash_sc_grpc_config
     from rtp_llm.ops import DashScGrpcConfig
 
-    return DashScGrpcConfig()
+    dash_sc_grpc_config = DashScGrpcConfig()
+    dash_sc_grpc_config.from_json(default_dash_sc_grpc_config_json())
+    return dash_sc_grpc_config
 
 
 def dash_sc_grpc_server_channel_options(dash_sc_grpc_config) -> list[tuple[str, int]]:
@@ -359,7 +362,10 @@ class DashScGrpcDrainAioInterceptor(grpc.aio.ServerInterceptor):
             return handler
 
         method = handler_call_details.method
-        if self._is_health_method(method):
+        # TODO: ServerLive is declared by predict_v2.proto but is not implemented
+        # by the DashSc servicers yet. Keep the historical liveness exemption so
+        # a future implementation remains callable while the process is draining.
+        if self._is_liveness_method(method):
             return handler
         if handler.request_streaming and handler.response_streaming:
             return grpc.stream_stream_rpc_method_handler(
@@ -386,8 +392,8 @@ class DashScGrpcDrainAioInterceptor(grpc.aio.ServerInterceptor):
         )
 
     @staticmethod
-    def _is_health_method(method: str) -> bool:
-        return method.endswith(("/ServerLive", "/ServerReady", "/ModelReady"))
+    def _is_liveness_method(method: str) -> bool:
+        return method.endswith("/ServerLive")
 
     async def _begin_or_abort(self, context, method: str) -> bool:
         if self._shutdown_manager.try_begin_request():
