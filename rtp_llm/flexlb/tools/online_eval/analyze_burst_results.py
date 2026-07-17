@@ -25,7 +25,7 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -151,7 +151,7 @@ def load_run_data(run_dir: Path, speed: int) -> SpeedRunData:
     data.summary = load_json_safe(run_dir / "load_client" / "summary.json")
     data.per_request = load_jsonl_safe(run_dir / "load_client" / "per_request.jsonl")
     data.monitor = load_jsonl_safe(run_dir / "monitor.jsonl")
-    data.log_events, data.log_found = parse_flexlb_log(run_dir / "flexlb.log")
+    data.log_events, data.log_found = parse_flexlb_log(flexlb_log_paths(run_dir))
     data.analysis = analyze_run(data)
     return data
 
@@ -166,7 +166,8 @@ _DISPATCH_RE = re.compile(
 )
 _DISPATCH_REASON_RE = re.compile(
     r"(target_batch_size|deadline_guard|window_timeout|batch_ready|"
-    r"max_inflight|predict_threshold|queue_overflow|budget_overrun)",
+    r"max_inflight|predict_threshold|fixed_window_timeout|batch_full|"
+    r"queue_overflow|budget_overrun)",
     re.IGNORECASE,
 )
 _QUEUE_DEPTH_RE = re.compile(
@@ -179,7 +180,16 @@ _OOM_RE = re.compile(r"OutOfMemoryError", re.IGNORECASE)
 _INFO_LINE_RE = re.compile(r"\bINFO\b\s", re.IGNORECASE)
 
 
-def parse_flexlb_log(path: Path) -> Tuple[Dict[str, Any], bool]:
+def flexlb_log_paths(run_dir: Path) -> List[Path]:
+    log_dir = run_dir / "flexlb_logs"
+    paths = list(log_dir.glob("flexlb.log*")) if log_dir.is_dir() else []
+    if paths:
+        return sorted(paths, key=lambda path: (path.stat().st_mtime_ns, path.name))
+    fallback = run_dir / "flexlb.log"
+    return [fallback] if fallback.is_file() else []
+
+
+def parse_flexlb_log(paths: Iterable[Path]) -> Tuple[Dict[str, Any], bool]:
     """Parse flexlb.log for dispatch events, queue depth, errors."""
     events: Dict[str, Any] = {
         "dispatch_batch_sizes": [],
@@ -191,49 +201,53 @@ def parse_flexlb_log(path: Path) -> Tuple[Dict[str, Any], bool]:
         "oom": False,
         "log_lines": 0,
     }
-    if not path.exists():
+    paths = list(paths)
+    if not paths:
         return events, False
     log_found = True
-    try:
-        content = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return events, False
-
-    for line in content.splitlines():
-        if "JAVA_TOOL_OPTIONS" in line or "Picked up JAVA_TOOL_OPTIONS" in line:
+    for path in paths:
+        try:
+            stream = path.open("r", encoding="utf-8", errors="replace")
+        except OSError:
             continue
-        events["log_lines"] += 1
-        is_info = bool(_INFO_LINE_RE.search(line))
-        if _OOM_RE.search(line):
-            events["oom"] = True
-        if not is_info and _ERROR_RE.search(line):
-            events["errors"] += 1
-        m = _DISPATCH_RE.search(line)
-        if m:
-            size_str = m.group(1) or m.group(2)
-            if size_str:
-                try:
-                    events["dispatch_batch_sizes"].append(int(size_str))
-                except ValueError:
-                    pass
-        m = _DISPATCH_REASON_RE.search(line)
-        if m:
-            reason = m.group(1).lower()
-            events["dispatch_reasons"][reason] = (
-                events["dispatch_reasons"].get(reason, 0) + 1
-            )
-        m = _QUEUE_DEPTH_RE.search(line)
-        if m:
-            depth_str = m.group(1) or m.group(2)
-            if depth_str:
-                try:
-                    events["queue_depth_values"].append(int(depth_str))
-                except ValueError:
-                    pass
-        if _BUDGET_OVERRUN_RE.search(line):
-            events["budget_overruns"] += 1
-        if _DROP_RE.search(line):
-            events["drops"] += 1
+        with stream:
+            for line in stream:
+                if "JAVA_TOOL_OPTIONS" in line or "Picked up JAVA_TOOL_OPTIONS" in line:
+                    continue
+                events["log_lines"] += 1
+                is_info = bool(_INFO_LINE_RE.search(line))
+                if _OOM_RE.search(line):
+                    events["oom"] = True
+                if not is_info and _ERROR_RE.search(line):
+                    events["errors"] += 1
+                m = _DISPATCH_RE.search(line)
+                if m:
+                    size_str = m.group(1) or m.group(2)
+                    if size_str:
+                        try:
+                            events["dispatch_batch_sizes"].append(int(size_str))
+                        except ValueError:
+                            pass
+                m = _DISPATCH_REASON_RE.search(line)
+                if m:
+                    reason = m.group(1).lower()
+                    events["dispatch_reasons"][reason] = (
+                        events["dispatch_reasons"].get(reason, 0) + 1
+                    )
+                m = _QUEUE_DEPTH_RE.search(line)
+                if m:
+                    depth_str = m.group(1) or m.group(2)
+                else:
+                    depth_str = None
+                if depth_str:
+                    try:
+                        events["queue_depth_values"].append(int(depth_str))
+                    except ValueError:
+                        pass
+                if _BUDGET_OVERRUN_RE.search(line):
+                    events["budget_overruns"] += 1
+                if _DROP_RE.search(line):
+                    events["drops"] += 1
     return events, log_found
 
 

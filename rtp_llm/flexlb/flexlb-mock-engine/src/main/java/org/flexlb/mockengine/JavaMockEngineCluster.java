@@ -79,12 +79,24 @@ public final class JavaMockEngineCluster {
             int decodeRunning = services.values().stream()
                     .filter(service -> service.roleType == EngineRpcService.RoleTypePB.ROLE_TYPE_DECODE)
                     .mapToInt(service -> service.activeDecodeRequests.get()).sum();
+            long prefillBatches = stats.prefillBatches.sum();
+            double avgBatchSize = prefillBatches == 0
+                    ? 0.0 : stats.prefillBatchRequests.sum() / (double) prefillBatches;
+            double avgBatchMs = prefillBatches == 0
+                    ? 0.0 : stats.prefillBatchExecutionMs.sum() / (double) prefillBatches;
+            Runtime runtime = Runtime.getRuntime();
+            long heapUsedMb = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024);
+            long heapMaxMb = runtime.maxMemory() / (1024 * 1024);
             System.out.printf(
                     "java_mock_stats enqueue_rpcs=%d enqueued_requests=%d status_rpcs=%d cache_rpcs=%d "
-                            + "prefill_pending=%d max_prefill_pending=%d decode_running=%d%n",
+                            + "prefill_batches=%d avg_batch_size=%.2f max_batch_size=%d "
+                            + "avg_batch_ms=%.2f max_batch_ms=%d prefill_pending=%d "
+                            + "max_prefill_pending=%d decode_running=%d heap_used_mb=%d heap_max_mb=%d%n",
                     stats.enqueueRpcs.sum(), stats.enqueuedRequests.sum(),
                     stats.statusRpcs.sum(), stats.cacheRpcs.sum(),
-                    prefillPending, maxPrefillPending, decodeRunning);
+                    prefillBatches, avgBatchSize, stats.maxPrefillBatchSize.get(),
+                    avgBatchMs, stats.maxPrefillBatchExecutionMs.get(),
+                    prefillPending, maxPrefillPending, decodeRunning, heapUsedMb, heapMaxMb);
         },
                 5, 5, TimeUnit.SECONDS);
 
@@ -226,7 +238,7 @@ public final class JavaMockEngineCluster {
         }
     }
 
-    private static final class FastRpcService extends RpcServiceGrpc.RpcServiceImplBase {
+    static final class FastRpcService extends RpcServiceGrpc.RpcServiceImplBase {
         private final String roleName;
         private final EngineRpcService.RoleTypePB roleType;
         private final int grpcPort;
@@ -238,21 +250,23 @@ public final class JavaMockEngineCluster {
         private final AtomicLong statusVersion = new AtomicLong();
         private final AtomicLong completionVersion = new AtomicLong();
         private final AtomicLong cacheVersion = new AtomicLong(1);
-        private final AtomicLong nextPrefillAvailableNanos = new AtomicLong();
+        private final Map<Integer, AtomicLong> nextPrefillAvailableNanosByDp = new ConcurrentHashMap<>();
         private final AtomicLong activeKvTokens = new AtomicLong();
         private final AtomicInteger pendingRequests = new AtomicInteger();
+        private final AtomicInteger waitingPrefillRequests = new AtomicInteger();
+        private final AtomicInteger activePrefillBatches = new AtomicInteger();
         private final AtomicInteger activeDecodeRequests = new AtomicInteger();
         private final ConcurrentLinkedQueue<VersionedTask> completions = new ConcurrentLinkedQueue<>();
         private final Map<Long, EngineRpcService.TaskInfoPB> runningTasks = new ConcurrentHashMap<>();
 
-        private FastRpcService(String roleName,
-                               EngineRpcService.RoleTypePB roleType,
-                               int grpcPort,
-                               Map<Integer, FastRpcService> services,
-                               ScheduledExecutorService scheduler,
-                               MockPerformanceModel performance,
-                               int cacheCapacity,
-                               ClusterStats stats) {
+        FastRpcService(String roleName,
+                       EngineRpcService.RoleTypePB roleType,
+                       int grpcPort,
+                       Map<Integer, FastRpcService> services,
+                       ScheduledExecutorService scheduler,
+                       MockPerformanceModel performance,
+                       int cacheCapacity,
+                       ClusterStats stats) {
             this.roleName = roleName.toUpperCase();
             this.roleType = roleType;
             this.grpcPort = grpcPort;
@@ -269,15 +283,15 @@ public final class JavaMockEngineCluster {
             stats.enqueueRpcs.increment();
             EngineRpcService.EnqueueBatchResponsePB.Builder response =
                     EngineRpcService.EnqueueBatchResponsePB.newBuilder().setBatchId(request.getBatchId());
-            List<MockPerformanceModel.RequestShape> shapes = new ArrayList<>();
             for (EngineRpcService.EnqueueBatchDpSlotPB slot : request.getDpSlotsList()) {
+                List<MockPerformanceModel.RequestShape> shapes = new ArrayList<>(slot.getRequestsCount());
                 for (EngineRpcService.EnqueueBatchExternalInputPB input : slot.getRequestsList()) {
                     stats.enqueuedRequests.increment();
                     response.addSuccessesBuilder().setRequestId(input.getInput().getRequestId());
                     shapes.add(performance.shape(input.getInput(), cache));
                 }
+                schedulePrefillCompletion(shapes, request.getBatchId(), slot.getDpRank());
             }
-            schedulePrefillCompletion(shapes, request.getBatchId());
             observer.onNext(response.build());
             observer.onCompleted();
         }
@@ -292,17 +306,20 @@ public final class JavaMockEngineCluster {
                 completions.poll();
             }
             long latestVersion = completionVersion.get();
-            int runningCount = runningTasks.size();
+            long runningCount = runningTasks.values().stream()
+                    .filter(task -> task.getPhase() == EngineRpcService.TaskPhase.TASK_PHASE_RUNNING)
+                    .count();
             long usedKv = Math.min(TOTAL_KV_TOKENS, activeKvTokens.get());
             EngineRpcService.WorkerStatusPB.Builder status = EngineRpcService.WorkerStatusPB.newBuilder()
                     .setAlive(true)
                     .setRole(roleName)
                     .setRoleType(roleType)
                     .setAvailableConcurrency(roleType == EngineRpcService.RoleTypePB.ROLE_TYPE_PREFILL
-                            ? Math.max(0, 1 - runningCount) : Math.max(0, 132 - runningCount))
+                            ? Math.max(0, 1 - activePrefillBatches.get())
+                            : Math.max(0, 132 - (int) runningCount))
                     .setWaitingQueryLen(roleType == EngineRpcService.RoleTypePB.ROLE_TYPE_PREFILL
-                            ? Math.max(0, pendingRequests.get() - 1) : 0)
-                    .setRunningQueryLen(runningCount)
+                            ? waitingPrefillRequests.get() : 0)
+                    .setRunningQueryLen((int) runningCount)
                     .setAvailableKvCache(TOTAL_KV_TOKENS - usedKv)
                     .setTotalKvCache(TOTAL_KV_TOKENS)
                     .setStatusVersion(statusVersion.incrementAndGet())
@@ -320,38 +337,68 @@ public final class JavaMockEngineCluster {
             observer.onCompleted();
         }
 
-        private void schedulePrefillCompletion(List<MockPerformanceModel.RequestShape> shapes, long batchId) {
+        private void schedulePrefillCompletion(List<MockPerformanceModel.RequestShape> shapes,
+                                               long batchId,
+                                               int dpRank) {
             if (shapes.isEmpty()) {
                 return;
             }
             long executionMs = performance.prefillMs(shapes);
             long now = System.nanoTime();
             long executionNanos = TimeUnit.MILLISECONDS.toNanos(executionMs);
+            AtomicLong nextAvailable = nextPrefillAvailableNanosByDp.computeIfAbsent(
+                    dpRank, ignored -> new AtomicLong());
+            long startNanos;
             long finishNanos;
             while (true) {
-                long previous = nextPrefillAvailableNanos.get();
-                long startNanos = Math.max(now, previous);
+                long previous = nextAvailable.get();
+                startNanos = Math.max(now, previous);
                 finishNanos = startNanos + executionNanos;
-                if (nextPrefillAvailableNanos.compareAndSet(previous, finishNanos)) {
+                if (nextAvailable.compareAndSet(previous, finishNanos)) {
                     break;
                 }
             }
+
+            stats.recordPrefillBatch(shapes.size(), executionMs);
             pendingRequests.addAndGet(shapes.size());
             for (MockPerformanceModel.RequestShape shape : shapes) {
-                runningTasks.put(shape.input().getRequestId(), runningTask(shape, batchId));
+                runningTasks.put(shape.input().getRequestId(),
+                        task(shape, batchId, dpRank, EngineRpcService.TaskPhase.TASK_PHASE_RECEIVED));
             }
+            long startDelayNanos = Math.max(0, startNanos - now);
+            if (startDelayNanos == 0) {
+                startPrefillBatch(shapes, batchId, dpRank);
+            } else {
+                waitingPrefillRequests.addAndGet(shapes.size());
+                scheduler.schedule(() -> {
+                    waitingPrefillRequests.addAndGet(-shapes.size());
+                    startPrefillBatch(shapes, batchId, dpRank);
+                }, startDelayNanos, TimeUnit.NANOSECONDS);
+            }
+
             long delayNanos = Math.max(0, finishNanos - now);
             scheduler.schedule(() -> {
                 for (MockPerformanceModel.RequestShape shape : shapes) {
                     runningTasks.remove(shape.input().getRequestId());
-                    recordCompletion(shape, batchId, executionMs);
+                    recordCompletion(shape, batchId, executionMs, dpRank);
                     startDecode(shape, batchId);
                     if (cache.admit(shape.blockKeys())) {
                         cacheVersion.incrementAndGet();
                     }
                 }
+                activePrefillBatches.decrementAndGet();
                 pendingRequests.addAndGet(-shapes.size());
             }, delayNanos, TimeUnit.NANOSECONDS);
+        }
+
+        private void startPrefillBatch(List<MockPerformanceModel.RequestShape> shapes,
+                                       long batchId,
+                                       int dpRank) {
+            activePrefillBatches.incrementAndGet();
+            for (MockPerformanceModel.RequestShape shape : shapes) {
+                runningTasks.put(shape.input().getRequestId(),
+                        task(shape, batchId, dpRank, EngineRpcService.TaskPhase.TASK_PHASE_RUNNING));
+            }
         }
 
         private void startDecode(MockPerformanceModel.RequestShape shape, long batchId) {
@@ -372,34 +419,39 @@ public final class JavaMockEngineCluster {
             int activeBatch = activeDecodeRequests.incrementAndGet();
             activeKvTokens.addAndGet(shape.inputLen());
             pendingRequests.incrementAndGet();
-            runningTasks.put(shape.input().getRequestId(), runningTask(shape, batchId));
+            runningTasks.put(shape.input().getRequestId(),
+                    task(shape, batchId, 0, EngineRpcService.TaskPhase.TASK_PHASE_RUNNING));
             long executionMs = performance.decodeMs(shape.outputLen(), activeBatch);
             scheduler.schedule(() -> {
                 runningTasks.remove(shape.input().getRequestId());
                 activeDecodeRequests.decrementAndGet();
                 activeKvTokens.addAndGet(-shape.inputLen());
                 pendingRequests.decrementAndGet();
-                recordCompletion(shape, batchId, executionMs);
+                recordCompletion(shape, batchId, executionMs, 0);
                 if (cache.admit(shape.blockKeys())) {
                     cacheVersion.incrementAndGet();
                 }
             }, executionMs, TimeUnit.MILLISECONDS);
         }
 
-        private EngineRpcService.TaskInfoPB runningTask(MockPerformanceModel.RequestShape shape, long batchId) {
+        private EngineRpcService.TaskInfoPB task(MockPerformanceModel.RequestShape shape,
+                                                 long batchId,
+                                                 int dpRank,
+                                                 EngineRpcService.TaskPhase phase) {
             return EngineRpcService.TaskInfoPB.newBuilder()
                     .setRequestId(shape.input().getRequestId())
                     .setInputLength(shape.inputLen())
                     .setPrefixLength(shape.hitTokens())
                     .setBatchId(batchId)
-                    .setPhase(EngineRpcService.TaskPhase.TASK_PHASE_RUNNING)
-                    .setDpRank(0)
+                    .setPhase(phase)
+                    .setDpRank(dpRank)
                     .build();
         }
 
         private void recordCompletion(MockPerformanceModel.RequestShape shape,
                                       long batchId,
-                                      long executionMs) {
+                                      long executionMs,
+                                      int dpRank) {
             long version = completionVersion.incrementAndGet();
             EngineRpcService.TaskInfoPB task = EngineRpcService.TaskInfoPB.newBuilder()
                     .setRequestId(shape.input().getRequestId())
@@ -410,7 +462,7 @@ public final class JavaMockEngineCluster {
                     .setEndTimeMs(System.currentTimeMillis())
                     .setExecutionTimeMs(executionMs)
                     .setIterateCount(1)
-                    .setDpRank(0)
+                    .setDpRank(dpRank)
                     .build();
             completions.add(new VersionedTask(version, task));
         }
@@ -452,11 +504,24 @@ public final class JavaMockEngineCluster {
         }
     }
 
-    private static final class ClusterStats {
+    static final class ClusterStats {
         private final LongAdder enqueueRpcs = new LongAdder();
         private final LongAdder enqueuedRequests = new LongAdder();
         private final LongAdder statusRpcs = new LongAdder();
         private final LongAdder cacheRpcs = new LongAdder();
+        private final LongAdder prefillBatches = new LongAdder();
+        private final LongAdder prefillBatchRequests = new LongAdder();
+        private final LongAdder prefillBatchExecutionMs = new LongAdder();
+        private final AtomicInteger maxPrefillBatchSize = new AtomicInteger();
+        private final AtomicLong maxPrefillBatchExecutionMs = new AtomicLong();
+
+        private void recordPrefillBatch(int batchSize, long executionMs) {
+            prefillBatches.increment();
+            prefillBatchRequests.add(batchSize);
+            prefillBatchExecutionMs.add(executionMs);
+            maxPrefillBatchSize.accumulateAndGet(batchSize, Math::max);
+            maxPrefillBatchExecutionMs.accumulateAndGet(executionMs, Math::max);
+        }
     }
 
     private static final class Config {

@@ -47,6 +47,7 @@ public class CriticalMetricsFilterConfig {
      *   <li>Master decision: route+submit time (decision start to batcher queue placement)</li>
      *   <li>Queue wait: batcher queue wait time (enqueue to dispatch trigger)</li>
      *   <li>Dispatch: dispatch-to-ACK time (gRPC dispatch to engine ACK)</li>
+     *   <li>Batch decision: exact dispatch count grouped by trigger reason</li>
      * </ul>
      */
     public static final Set<String> CRITICAL_METRICS = Set.of(
@@ -55,7 +56,8 @@ public class CriticalMetricsFilterConfig {
             "app.grpc.server.process.ms",              // gRPC server entry to BalanceContext start
             "app.flexlb.route.submit.time.ms",          // master decision start to batcher queue
             "app.routing.queue.wait.time.ms",           // batcher queue wait to dispatch
-            "app.flexlb.dispatch.ack.time.ms"           // dispatch gRPC to engine ACK
+            "app.flexlb.dispatch.ack.time.ms",          // dispatch gRPC to engine ACK
+            "app.engine.balancing.master.dispatch.reason" // exact batch trigger counters
     );
 
     /**

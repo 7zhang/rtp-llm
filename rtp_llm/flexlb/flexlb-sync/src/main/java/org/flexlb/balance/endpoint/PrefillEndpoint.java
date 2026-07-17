@@ -409,7 +409,8 @@ public class PrefillEndpoint extends WorkerEndpoint {
 
         long predictedMs = batch.predictTimeMs();
         long gapMs = actualMs - predictedMs;
-        logger.info("flexlb_batch_complete batch_id={} predicted_ms={} actual_ms={} gap_ms={} batch_size={} engine={}",
+        org.flexlb.util.Logger.info(
+                "flexlb_batch_complete batch_id={} predicted_ms={} actual_ms={} gap_ms={} batch_size={} engine={}",
                 batchId, predictedMs, actualMs, gapMs, batch.requests().size(), getIp());
 
         // Feed the actual-vs-predicted timing back into the predictor for future learning.

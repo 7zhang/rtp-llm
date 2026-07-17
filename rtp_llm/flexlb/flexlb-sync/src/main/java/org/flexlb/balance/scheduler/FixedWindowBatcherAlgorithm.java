@@ -153,7 +153,7 @@ public class FixedWindowBatcherAlgorithm implements BatcherAlgorithm {
         ctx.reporter().reportBatchCacheHitMetrics(RoleType.PREFILL.name(), ctx.prefillEp().getIp(), ctx.prefillEp().ipPort(), totalHitCache, totalSeqLen);
         ctx.reporter().reportBatchTotalTokens(RoleType.PREFILL.name(), ctx.prefillEp().getIp(), ctx.prefillEp().ipPort(), reason, totalSeqLen);
 
-        Logger.info("flexlb_batch_decision reason={} picked_size={} "
+        Logger.debug("flexlb_batch_decision reason={} picked_size={} "
                         + "wait_ms={} queue_before={} worker={} head_req_id={}",
                 reason, picked.size(), waitMs, ctx.size(), ctx.key(), head.requestId());
 

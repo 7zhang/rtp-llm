@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import Counter
 import json
 import os
 import socket
@@ -25,6 +26,13 @@ from online_eval.trace_loader import (
     load_replay_requests,
     stable_request_id,
 )
+
+
+def peak_bucket_qps(epoch_ms_values: List[float], window_ms: int) -> float:
+    if not epoch_ms_values or window_ms <= 0:
+        return 0.0
+    buckets = Counter(int(value // window_ms) for value in epoch_ms_values)
+    return round(max(buckets.values(), default=0) * 1000.0 / window_ms, 3)
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,6 +66,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument(
+        "--start-at-epoch-ms",
+        type=float,
+        default=0.0,
+        help="shared wall-clock start barrier for synchronized multi-process replay",
+    )
     parser.add_argument("--skip-server-latency", action="store_true")
     parser.add_argument(
         "--schedule-mode", choices=["auto", "batch", "direct", "queue"], default="batch"
@@ -163,6 +177,8 @@ class LoadClient:
         self._success_count: int = 0
         self._error_count: int = 0
         self._last_gradient_log: float = 0.0
+        self._replay_started_monotonic: Optional[float] = None
+        self._replay_started_epoch_ms: float = 0.0
         if getattr(args, "endpoints_file", None):
             self._load_fallback_endpoints(args.endpoints_file)
 
@@ -259,7 +275,16 @@ class LoadClient:
             self.args.max_concurrency if self.args.max_concurrency > 0 else 999_999_999
         )
         sem = asyncio.Semaphore(_mc)
-        started_at = time.monotonic()
+        target_epoch_ms = self.args.start_at_epoch_ms
+        if target_epoch_ms > 0:
+            wait_s = target_epoch_ms / 1000.0 - time.time()
+            if wait_s > 0:
+                await asyncio.sleep(wait_s)
+        now_epoch_ms = time.time() * 1000.0
+        late_s = max(0.0, (now_epoch_ms - target_epoch_ms) / 1000.0) if target_epoch_ms > 0 else 0.0
+        started_at = time.monotonic() - late_s
+        self._replay_started_monotonic = started_at
+        self._replay_started_epoch_ms = target_epoch_ms if target_epoch_ms > 0 else now_epoch_ms
         self._send_start = started_at
         # Start pushgateway metrics push loop
         if self._pushgateway_url:
@@ -306,6 +331,7 @@ class LoadClient:
                     current_speed = self.args.replay_speed
 
                 # Calculate timing with loop offset
+                due_s = time.monotonic() - started_at
                 if current_speed > 0 and req.ts_ms > 0:
                     loop_offset_ms = loop_idx * trace_span_ms
                     due_s = (
@@ -326,7 +352,9 @@ class LoadClient:
                     loop_req = self._make_loop_request(req, loop_idx, sent_count)
 
                 tasks.append(
-                    asyncio.create_task(self._handle_with_semaphore(loop_req, sem))
+                    asyncio.create_task(
+                        self._handle_with_semaphore(loop_req, sem, due_s)
+                    )
                 )
                 sent_count += 1
                 self._sent_count = sent_count
@@ -426,7 +454,7 @@ class LoadClient:
         )
 
     async def _handle_with_semaphore(
-        self, req: ReplayRequest, sem: asyncio.Semaphore
+        self, req: ReplayRequest, sem: asyncio.Semaphore, due_s: float
     ) -> None:
         started = time.monotonic()
 
@@ -434,9 +462,8 @@ class LoadClient:
         async with sem:
             self._inflight_count += 1
             try:
-                self._actual_sent_count += 1
                 result, input_pb, schedule_response = await self._do_schedule(
-                    req, started
+                    req, started, due_s
                 )
             finally:
                 self._inflight_count -= 1
@@ -519,7 +546,7 @@ class LoadClient:
         return val.lower() not in ("0", "false", "no")
 
     async def _do_schedule(
-        self, req: ReplayRequest, started: float
+        self, req: ReplayRequest, started: float, due_s: float
     ) -> tuple[dict, Optional[object], Optional[object]]:
         """Execute the Schedule RPC only (no fetch response).
 
@@ -561,11 +588,19 @@ class LoadClient:
             "error": "",
             "route_path": "master",
             "wall_clock_ts": 0.0,
+            "send_due_epoch_ms": round(self._replay_started_epoch_ms + due_s * 1000.0, 3),
+            "send_start_epoch_ms": 0.0,
+            "pacing_lag_ms": 0.0,
         }
 
         try:
-            schedule_start = time.monotonic()
             flexlb_stub = await self._schedule_stub(self._flexlb_target())
+            schedule_start = time.monotonic()
+            self._actual_sent_count += 1
+            result["send_start_epoch_ms"] = time.time_ns() / 1_000_000.0
+            result["pacing_lag_ms"] = round(
+                max(0.0, result["send_start_epoch_ms"] - result["send_due_epoch_ms"]), 3
+            )
             response = await flexlb_stub.Schedule(
                 schedule_req, timeout=self.args.timeout_ms / 1000.0
             )
@@ -896,6 +931,22 @@ class LoadClient:
             if self._send_start is not None and self._send_end is not None
             else 0.0
         )
+        rpc_start_times = sorted(
+            r["send_start_epoch_ms"]
+            for r in self._results
+            if r.get("send_start_epoch_ms", 0.0) > 0
+        )
+        pacing_lags = [
+            r["pacing_lag_ms"]
+            for r in self._results
+            if r.get("send_start_epoch_ms", 0.0) > 0
+        ]
+        actual_rpc_qps = (
+            round((len(rpc_start_times) - 1) * 1000.0
+                  / (rpc_start_times[-1] - rpc_start_times[0]), 3)
+            if len(rpc_start_times) > 1 and rpc_start_times[-1] > rpc_start_times[0]
+            else 0.0
+        )
         summary = {
             "trace": self.args.trace,
             "max_concurrency": self.args.max_concurrency,
@@ -919,16 +970,18 @@ class LoadClient:
             "send_duration_s": round(send_duration_s, 3),
             "sent_count": self._sent_count,
             "actual_sent_count": self._actual_sent_count,
+            "recorded_result_count": len(self._results),
             "send_qps": (
                 round(len(self._results) / send_duration_s, 3)
                 if send_duration_s > 0
                 else 0.0
             ),
-            "actual_send_qps": (
-                round(self._actual_sent_count / send_duration_s, 3)
-                if send_duration_s > 0
-                else 0.0
-            ),
+            "actual_send_qps": actual_rpc_qps,
+            "pacing_lag_ms": summarize_latencies(pacing_lags),
+            "send_peak_qps": {
+                f"{window_ms}ms": peak_bucket_qps(rpc_start_times, window_ms)
+                for window_ms in (1, 10, 100, 1000)
+            },
             "server_arrival_qps": server_latency.get("arrival_qps", 0.0),
             "server_completion_qps": server_latency.get("completion_qps", 0.0),
             "n_channels": self._n_channels,

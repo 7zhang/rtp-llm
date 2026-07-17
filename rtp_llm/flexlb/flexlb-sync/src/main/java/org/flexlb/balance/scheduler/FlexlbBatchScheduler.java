@@ -5,6 +5,7 @@ import org.flexlb.balance.endpoint.EndpointRegistry;
 import org.flexlb.balance.endpoint.PrefillEndpoint;
 import org.flexlb.balance.strategy.PrefillTimePredictor;
 import org.flexlb.config.ConfigService;
+import org.flexlb.config.FlexlbConfig;
 import org.flexlb.dao.BalanceContext;
 import org.flexlb.dao.loadbalance.DebugInfo;
 import org.flexlb.dao.loadbalance.Response;
@@ -356,12 +357,12 @@ public class FlexlbBatchScheduler implements BatchDecisionHandler, DispatchCallb
 
     @Override
     public void onUrgent(BatchItem head, DispatchMeta meta) {
-        flushItems(List.of(head), meta.reason());
+        flushItems(List.of(head), meta);
     }
 
     @Override
     public void onBatchReady(List<BatchItem> items, DispatchMeta meta) {
-        flushItems(items, meta.reason());
+        flushItems(items, meta);
     }
 
     @Override
@@ -391,7 +392,8 @@ public class FlexlbBatchScheduler implements BatchDecisionHandler, DispatchCallb
      * and performs fast in-memory operations. The heavy gRPC I/O is handled
      * asynchronously by the dispatcher's own thread pool.
      */
-    private void flushItems(List<BatchItem> items, String reason) {
+    private void flushItems(List<BatchItem> items, DispatchMeta meta) {
+        String reason = meta.reason();
         PrefillEndpoint prefillEp = items.get(0).prefillEp();
 
         // [SYNC] Filter cancelled/done items first — avoid committing them to the endpoint
@@ -440,6 +442,14 @@ public class FlexlbBatchScheduler implements BatchDecisionHandler, DispatchCallb
         // [ASYNC] Delegate gRPC dispatch — dispatcher owns its own thread pool
         long waitMs = System.currentTimeMillis() - items.get(0).enqueuedAtMs();
         reporter.reportBatchWaitTimeMs(RoleType.PREFILL.name(), prefillEp != null ? prefillEp.getIp() : "", prefillEp != null ? prefillEp.ipPort() : "", waitMs);
+        FlexlbConfig config = configService.loadBalanceConfig();
+        Logger.info("flexlb_batch_dispatch batch_id={} reason={} batch_size={} wait_ms={} "
+                        + "predicted_ms={} threshold_ms={} fixed_wait_ms={} batch_size_max={} "
+                        + "queue_after={} worker={}",
+                batchId, reason, dispatchable.size(), waitMs, predMs,
+                config.getFlexlbBatchPredictThresholdMs(), config.getFlexlbBatchFixedWaitMs(),
+                config.getFlexlbBatchSizeMax(), meta.queueDepth(),
+                prefillEp != null ? prefillEp.ipPort() : "");
 
         // Record dispatch timestamp for dispatch-to-ACK latency metric
         for (BatchItem item : dispatchable) {

@@ -2,7 +2,7 @@
 
 本文用于交接 FlexLB Master 的 batch 调度性能测试。目标是让接手人能够复现测试、逐级寻找容量拐点，并判断瓶颈在发压端、FlexLB Master 还是 mock engine。
 
-本次基准结果见 [FlexLB Master + Mock Engine Batch 性能报告](flexlb-master-mock-engine-performance-20260717.md)。
+fixed-window 10 ms 基准结果见 [FlexLB Master + Mock Engine Batch 性能报告](flexlb-master-mock-engine-performance-20260717.md)。500 ms 预测阈值、160 ms 固定等待的评估见 [FlexLB Master SLO Batch 性能评估](flexlb-master-slo-batch-evaluation-20260717.md)。
 
 ## 1. 测试目标和边界
 
@@ -12,7 +12,7 @@
 
 本手册只测 Master 调度能力：
 
-- 必须使用 `SCHEDULE_MODE=batch`、`SCHEDULE_ONLY=1`、`FLEXLB_BATCH_ALGORITHM=fixed_window` 和 `FLEXLB_BATCH_FIXED_WAIT_MS=10`。
+- 必须使用 `SCHEDULE_MODE=batch` 和 `SCHEDULE_ONLY=1`。10 ms base case 使用 `FLEXLB_BATCH_FIXED_WAIT_MS=10`；SLO case 使用独立配置文件中的 500 ms 预测阈值和 160 ms 固定等待。
 - 不调用 `FetchResponse`。Fetch 是 frontend 的后续动作，不属于 Master Schedule 性能。
 - 吞吐以 Master 服务端的 `server_arrival_qps` 为准。
 - 延迟以 Master 服务端的 `schedule_latency_ms` 为准，不以 client RTT 作为最终报告口径。
@@ -24,6 +24,7 @@
 2. `server_latency.json` 中 `arrival_count == completion_count`。
 3. FlexLB、mock engine 和 load client 全程存活，无 OOM、拒绝执行或无可用 worker 错误。
 4. 使用同一份 trace、Master 配置、mock 性能模型、engine 数量和代码版本进行横向比较。
+5. `test_valid == true`，包括所有计划任务已启动、所有 RPC 已记录、Master 计数匹配和 client pacing P99 达标。
 
 ## 2. 三类 worker 不要混淆
 
@@ -71,6 +72,8 @@ lsof -nP -iTCP:61000-62249 -sTCP:LISTEN | head
 ```
 
 建议文件描述符上限至少为 65535。正式记录结果前还应记录机器 CPU 型号、逻辑核数、内存、容器 CPU/memory limit 和代码 commit。
+
+共享机器上建议设置 `FLEXLB_NETWORK_ISOLATED=1`。脚本会使用 user/network namespace 并只启用 namespace 内的 loopback，从而避免和其他用户的 7001/7002/7003、61000 至 62249 端口冲突。该方式不隔离 CPU 和内存。脚本默认通过 `FLEXLB_FAIL_ON_CONCURRENT_TEST=1` 检查宿主机上其他 FlexLB、mock 和 load client 进程，发现并发测试就立即退出；只有明确接受数据污染风险时才可设为 0。
 
 ### 3.3 输入文件
 
@@ -150,15 +153,15 @@ next_speed = current_speed * target_master_qps / measured_server_arrival_qps
 
 | 目标 Master QPS | 初始 Replay speed | 建议 load client workers |
 |---:|---:|---:|
-| 100 | 13 | 1 |
+| 100 | 14 | 1 |
 | 250 | 32 | 1 |
 | 500 | 64 | 1 |
-| 1000 | 125 | 1 |
+| 1000 | 125 至 130 | 1 |
 | 2000 | 250 | 1 或 2 |
 | 3000 | 375 | 2 |
 | 5000 | 650 | 4 |
 | 8000 | 1000 | 8 |
-| 10000 | 1250 | 8 |
+| 10000 | 1400 | 8 |
 
 load worker 变化会改变发压端微突发形态。要比较不同 Master 代码或 `SCHEDULE_WORKER_SIZE`，必须固定 `LOAD_CLIENT_WORKERS`；要证明发压端不是瓶颈，可以在相同目标 QPS 下补做不同 load worker 的对照组。
 
@@ -251,10 +254,56 @@ run_case 2 250 2000
 run_case 2 375 3000
 run_case 4 650 5000
 run_case 8 1000 8000
-run_case 8 1250 10000
+run_case 8 1400 10000
 ```
 
 不要同时并行跑多个 case。每个 case 都会占用相同端口，并且并行运行会污染 CPU、网络和延迟数据。
+
+### 8.1 SLO batch 评估
+
+下面命令固定 Master 16 worker 和 load client 8 worker，使用 500 ms 预测阈值、160 ms 固定等待、最大 batch 32，并在 10K 目标档运行 30 秒：
+
+```bash
+cd "$RTP_LLM_OPEN_SOURCE/rtp_llm/flexlb/tools/online_eval"
+
+export JAVA_HOME="${JAVA21_HOME:-$HOME/java21}"
+export JAVA21_HOME="$JAVA_HOME"
+export PATH="$JAVA_HOME/bin:$PATH"
+export PYTHON_BIN="${PYTHON_BIN:-$HOME/.venvs/flexlb-eval/bin/python3}"
+
+PYTHON_BIN="$PYTHON_BIN" \
+FLEXLB_NETWORK_ISOLATED=1 \
+RUN_ID="slo500_wait160_10k_$(date +%Y%m%d_%H%M%S)" \
+N_PREFILL=750 \
+N_DECODE=500 \
+MOCK_ENGINE_IMPL=java \
+JAVA_MOCK_EVENT_LOOP_THREADS=32 \
+JAVA_MOCK_ENGINE_HEAP_SIZE=32g \
+PERFORMANCE_FILE="$PWD/data/performance/dsv4_flash_performance.formula_1x.json" \
+PROCESS_CONFIG_FILE="$PWD/data/config/master_fixed_window_slo500_wait160.json" \
+SCHEDULE_MODE=batch \
+SCHEDULE_ONLY=1 \
+SCHEDULE_WORKER_SIZE=16 \
+LOAD_CLIENT_WORKERS=8 \
+REPLAY_SPEED=1400 \
+DURATION_S=30 \
+LOOP=1 \
+LIMIT=999999999 \
+MAX_CONCURRENCY=131072 \
+FLEXLB_WARMUP_SECONDS=10 \
+LOAD_CLIENT_START_DELAY_SECONDS=10 \
+CLIENT_PACING_LAG_P99_LIMIT_MS=100 \
+FLEXLB_JVM_HEAP_SIZE=32g \
+FLEXLB_JVM_XMS=32g \
+FLEXLB_JVM_XMX=32g \
+SLO_BATCH_DRAIN_SECONDS=10 \
+JFR_DURATION=120s \
+bash run_online_eval.sh
+```
+
+做容量矩阵时只修改 `REPLAY_SPEED`，按 14、130、650、1400 依次运行，分别对应约 100、1K、5K、10K QPS。比较不同压力时不要改变 Master/load worker 数。
+
+脚本会在开始阶段校验 Java 21，以及 `PYTHON_BIN` 是否可导入 `aiohttp` 和 `grpc`。未满足依赖时会立即退出。测试结束会保存 `master_prometheus_after.prom`，`analyze_slo_batch.py` 优先使用 Prometheus counter 统计精确 dispatch reason 总量，并用 `log_coverage_ratio` 标识逐批日志覆盖率。
 
 ## 9. 读取和校验结果
 
@@ -265,6 +314,8 @@ run_case 8 1250 10000
 | `load_client/summary.json` | 合并后的 QPS、错误数和 Master 服务端延迟 |
 | `load_client/server_latency.json` | Master arrival/completion 计数和各阶段延迟原始值 |
 | `load_client/shard_*/summary.json` | 多 load worker 时每个发压分片的数据 |
+| `load_client/slo_batch_analysis.json` | Batch reason、batch size、预测时间、SLO 和 mock 汇总 |
+| `master_prometheus_after.prom` | Master 退出前的 Prometheus 快照，含精确 dispatch reason counter |
 | `flexlb_profile.jfr` | FlexLB JVM profile |
 | `flexlb.log` | Master 日志、拒绝执行、无可用 worker、GC/OOM 线索 |
 | `mock_engine.log` | mock 的 RPC 数、prefill pending 和 decode running |
