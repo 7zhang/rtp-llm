@@ -1,7 +1,6 @@
 package org.flexlb.balance.strategy;
 
 import org.apache.commons.collections4.CollectionUtils;
-import org.apache.commons.collections4.MapUtils;
 import org.flexlb.balance.endpoint.DecodeEndpoint;
 import org.flexlb.balance.resource.DecodeResourceMeasure;
 import org.flexlb.balance.resource.ResourceMeasureFactory;
@@ -83,29 +82,28 @@ public class CostBasedDecodeStrategy implements LoadBalanceStrategy {
     private record FilterResult(List<DecodeEndpoint> endpoints, Map<String, Integer> rejections) {}
 
     private EndpointFilterResult getAvailableEndpoints(RoleType roleType, String group, ResourceMeasureIndicatorEnum indicator) {
-        Map<String, WorkerEndpoint> workerEndpointMap = engineWorkerStatus.selectModelWorkerStatus(roleType, group);
-        if (MapUtils.isEmpty(workerEndpointMap)) {
-            return new EndpointFilterResult(new ArrayList<>(), Map.of("NO_REGISTERED", 1));
-        }
         DecodeResourceMeasure measure = (DecodeResourceMeasure) resourceMeasureFactory.getMeasure(indicator);
         if (measure == null) {
             return new EndpointFilterResult(new ArrayList<>(), Map.of("NO_REGISTERED", 1));
         }
-        List<DecodeEndpoint> result = new ArrayList<>();
+        List<DecodeEndpoint> result = new ArrayList<>(engineWorkerStatus.getModelWorkerCapacity(roleType));
         Map<String, Integer> rejections = new java.util.HashMap<>();
-        for (WorkerEndpoint ep : workerEndpointMap.values()) {
+        int registered = engineWorkerStatus.forEachModelWorkerEndpoint(roleType, group, (ipPort, ep) -> {
             if (!(ep instanceof DecodeEndpoint de)) {
-                continue;
+                return;
             }
             if (!de.getStatus().isAlive()) {
                 rejections.merge("NOT_ALIVE", 1, Integer::sum);
-                continue;
+                return;
             }
             if (!measure.isResourceAvailable(de)) {
                 rejections.merge("RESOURCE_UNAVAILABLE", 1, Integer::sum);
-                continue;
+                return;
             }
             result.add(de);
+        });
+        if (registered == 0) {
+            return new EndpointFilterResult(result, Map.of("NO_REGISTERED", 1));
         }
         return new EndpointFilterResult(result, rejections);
     }

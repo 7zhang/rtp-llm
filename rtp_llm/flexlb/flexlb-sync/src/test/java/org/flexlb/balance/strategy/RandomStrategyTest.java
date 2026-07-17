@@ -5,6 +5,7 @@ import org.flexlb.balance.endpoint.EndpointRegistry;
 import org.flexlb.balance.endpoint.PrefillEndpoint;
 import org.flexlb.balance.endpoint.DecodeEndpoint;
 import org.flexlb.balance.endpoint.WorkerEndpoint;
+import org.flexlb.balance.endpoint.SimpleWorkerEndpoint;
 import org.flexlb.balance.resource.ResourceMeasure;
 import org.flexlb.balance.resource.ResourceMeasureFactory;
 import org.flexlb.config.ConfigService;
@@ -187,6 +188,21 @@ class RandomStrategyTest {
 
         assertTrue(prefillResult.isSuccess());
         assertTrue(decodeResult.isSuccess());
+    }
+
+    @Test
+    void should_select_vit_from_role_specific_registry() {
+        WorkerStatus vitWorker = createWorkerStatus("127.0.0.3");
+        vitWorker.setRole(RoleType.VIT);
+        EngineWorkerStatus.MODEL_ROLE_WORKER_STATUS.getVitStatusMap()
+                .put("127.0.0.3:8080", vitWorker);
+        endpointRegistry.putVit(
+                "127.0.0.3:8080", new SimpleWorkerEndpoint(vitWorker));
+
+        BalanceContext context = new BalanceContext();
+        context.setRequest(new Request());
+
+        assertTrue(randomStrategy.select(context, RoleType.VIT, null).isSuccess());
     }
 
     @Test

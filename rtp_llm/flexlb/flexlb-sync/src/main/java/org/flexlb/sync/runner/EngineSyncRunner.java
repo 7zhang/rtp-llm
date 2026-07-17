@@ -184,7 +184,8 @@ public class EngineSyncRunner implements Runnable {
                 for (Map.Entry<String, WorkerStatus> entry : workerStatusMap.entrySet()) {
                     WorkerStatus workerStatus = entry.getValue();
                     sumStepLatency += workerStatus.getStepLatencyMs();
-                    WorkerEndpoint ep = endpointRegistry != null ? endpointRegistry.get(entry.getKey()) : null;
+                    WorkerEndpoint ep = endpointRegistry != null
+                            ? endpointRegistry.get(roleType, entry.getKey()) : null;
                     sumRunningLoad += ep != null ? ep.getLoadMetric() : 0;
                 }
                 double meanStepLatency = sumStepLatency / size;
@@ -196,7 +197,8 @@ public class EngineSyncRunner implements Runnable {
                 for (Map.Entry<String, WorkerStatus> entry : workerStatusMap.entrySet()) {
                     WorkerStatus workerStatus = entry.getValue();
                     double diff = workerStatus.getStepLatencyMs() - meanStepLatency;
-                    WorkerEndpoint ep = endpointRegistry != null ? endpointRegistry.get(entry.getKey()) : null;
+                    WorkerEndpoint ep = endpointRegistry != null
+                            ? endpointRegistry.get(roleType, entry.getKey()) : null;
                     double diff2 = (ep != null ? ep.getLoadMetric() : 0) - meanRunningLoad;
                     sumStepLatencyOfSquaredDiffs += diff * diff;
                     sumRunningLoadOfSquaredDiffs += diff2 * diff2;
@@ -233,20 +235,16 @@ public class EngineSyncRunner implements Runnable {
         int grpcPort = CommonUtils.toGrpcPort(httpPort);
         workerStatus.setGrpcPort(grpcPort);
 
-        if (roleType == RoleType.PREFILL) {
+        if (roleType == RoleType.PREFILL || roleType == RoleType.PDFUSION) {
             long dpSize = workerStatus.getDpSize();
             if (dpSize > 1) {
                 String message = String.format(
-                        "Prefill DP group endpoint not yet supported: model=%s, ipPort=%s, dp_size=%d",
-                        modelName, ipPort, dpSize);
+                        "%s DP group endpoint not yet supported: model=%s, ipPort=%s, dp_size=%d",
+                        roleType, modelName, ipPort, dpSize);
                 logger.error(message);
                 throw new UnsupportedOperationException(message);
             }
-            endpointRegistry.ensurePrefillEndpoint(ipPort, workerStatus);
-        } else if (roleType == RoleType.DECODE) {
-            endpointRegistry.ensureDecodeEndpoint(ipPort, workerStatus);
-        } else {
-            throw new IllegalArgumentException("Unsupported role type: " + roleType);
         }
+        endpointRegistry.ensureEndpoint(roleType, ipPort, workerStatus);
     }
 }

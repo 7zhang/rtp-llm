@@ -45,6 +45,7 @@ class CostBasedPrefillStrategyTest {
     @BeforeEach
     void setUp() {
         EngineWorkerStatus.MODEL_ROLE_WORKER_STATUS.getPrefillStatusMap().clear();
+        EngineWorkerStatus.MODEL_ROLE_WORKER_STATUS.getPdFusionStatusMap().clear();
         ConfigService configService = Mockito.mock(ConfigService.class);
         Mockito.when(configService.loadBalanceConfig()).thenReturn(new FlexlbConfig());
         cacheAwareService = Mockito.mock(CacheAwareService.class);
@@ -292,17 +293,41 @@ class CostBasedPrefillStrategyTest {
         assertEquals(0, (long) predictor.predictBatchMs(List.of()));
     }
 
+    @Test
+    void selectsPdFusionEndpointFromItsOwnRegistry() {
+        String ipPort = "10.0.0.1:8080";
+        WorkerStatus worker = createUnregisteredWorker("10.0.0.1");
+        worker.setRole(RoleType.PDFUSION);
+        EngineWorkerStatus.MODEL_ROLE_WORKER_STATUS.getPdFusionStatusMap().clear();
+        EngineWorkerStatus.MODEL_ROLE_WORKER_STATUS.getPdFusionStatusMap().put(ipPort, worker);
+        endpointRegistry.ensurePdFusionEndpoint(ipPort, worker);
+
+        ServerStatus result = strategy.select(
+                buildContext(500, 41L), RoleType.PDFUSION, null);
+
+        assertTrue(result.isSuccess());
+        assertEquals(RoleType.PDFUSION, result.getRole());
+    }
+
+    @Test
+    void candidateBufferGrowsWithRegistryAndRemainsReusable() {
+        Map<String, WorkerStatus> prefillMap =
+                EngineWorkerStatus.MODEL_ROLE_WORKER_STATUS.getPrefillStatusMap();
+        prefillMap.put("10.0.0.1:8080", createWorker("10.0.0.1", 0));
+        assertTrue(strategy.select(buildContext(500, 51L), RoleType.PREFILL, null).isSuccess());
+
+        for (int i = 2; i <= 40; i++) {
+            String ip = "10.0.1." + i;
+            prefillMap.put(ip + ":8080", createWorker(ip, 0));
+        }
+
+        for (long requestId = 52; requestId < 72; requestId++) {
+            assertTrue(strategy.select(buildContext(500, requestId), RoleType.PREFILL, null).isSuccess());
+        }
+    }
+
     private WorkerStatus createWorker(String ip, long estimatedWaitMs) {
-        WorkerStatus w = new WorkerStatus();
-        w.setIp(ip);
-        w.setPort(8080);
-        w.setAlive(true);
-        w.setRole(RoleType.PREFILL);
-        CacheStatus cacheStatus = new CacheStatus();
-        cacheStatus.setAvailableKvCache(10000);
-        cacheStatus.setBlockSize(256);
-        w.setCacheStatus(cacheStatus);
-        w.setRunningTaskList(new HashMap<>());
+        WorkerStatus w = createUnregisteredWorker(ip);
 
         String ipPort = ip + ":8080";
         w.setGrpcPort(8081);
@@ -311,6 +336,21 @@ class CostBasedPrefillStrategyTest {
             ep.commitBatch(900000L + ip.hashCode(), estimatedWaitMs,
                     List.of(batchItem(900000L + ip.hashCode(), estimatedWaitMs, 0)));
         }
+        return w;
+    }
+
+    private WorkerStatus createUnregisteredWorker(String ip) {
+        WorkerStatus w = new WorkerStatus();
+        w.setIp(ip);
+        w.setPort(8080);
+        w.setGrpcPort(8081);
+        w.setAlive(true);
+        w.setRole(RoleType.PREFILL);
+        CacheStatus cacheStatus = new CacheStatus();
+        cacheStatus.setAvailableKvCache(10000);
+        cacheStatus.setBlockSize(256);
+        w.setCacheStatus(cacheStatus);
+        w.setRunningTaskList(new HashMap<>());
         return w;
     }
 

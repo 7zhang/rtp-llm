@@ -173,14 +173,14 @@ public class DefaultRouter implements Router {
         for (ServerStatus serverStatus : partialResults) {
             String serverIpPort = serverStatus.getServerIp() + ":" + serverStatus.getHttpPort();
             long requestId = balanceContext.getRequestId();
+            RoleType role = serverStatus.getRole();
 
-            WorkerEndpoint ep = endpointRegistry.get(serverIpPort);
+            WorkerEndpoint ep = endpointRegistry.get(role, serverIpPort);
             if (ep == null) {
                 Logger.warn("DefaultRouter.rollBack: endpoint not found for ipPort={}", serverIpPort);
                 continue;
             }
 
-            RoleType role = serverStatus.getRole();
             LoadBalanceStrategy loadBalanceStrategy = getLoadBalanceStrategy(role);
             loadBalanceStrategy.rollBack(ep, requestId);
         }

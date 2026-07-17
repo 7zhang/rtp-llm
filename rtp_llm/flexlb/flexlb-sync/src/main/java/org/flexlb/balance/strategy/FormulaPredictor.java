@@ -34,6 +34,7 @@ public class FormulaPredictor implements PrefillTimePredictor {
     private static final Logger logger = LoggerFactory.getLogger("syncLogger");
 
     private final PrefillTimeFormula formula;
+    private final String sourceFormula;
 
     /**
      * Monotonic version counter incremented on every {@link #setParameter}.
@@ -60,6 +61,7 @@ public class FormulaPredictor implements PrefillTimePredictor {
      * @param formulaString the cost formula expression
      */
     public FormulaPredictor(String formulaString) {
+        this.sourceFormula = formulaString;
         this.formula = PrefillTimeFormula.parse(formulaString);
         logger.info("formula predictor created, formula: {}", formulaString);
     }
@@ -140,6 +142,10 @@ public class FormulaPredictor implements PrefillTimePredictor {
 
     public boolean hasParameters() {
         return formula.hasParameters();
+    }
+
+    String immutableFormulaKey() {
+        return hasParameters() ? null : sourceFormula;
     }
 
     /** The parsed formula, for inspection. */

@@ -11,6 +11,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
+import java.util.concurrent.atomic.AtomicInteger;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -27,6 +29,9 @@ class EngineWorkerStatusTest {
 
     @BeforeEach
     void setUp() {
+        for (RoleType roleType : RoleType.values()) {
+            EngineWorkerStatus.MODEL_ROLE_WORKER_STATUS.getRoleStatusMap(roleType).clear();
+        }
         configService = Mockito.mock(ConfigService.class);
         Mockito.when(configService.loadBalanceConfig()).thenReturn(new FlexlbConfig());
         registry = new EndpointRegistry(configService, null, Mockito.mock(BatchSchedulerReporter.class));
@@ -217,5 +222,54 @@ class EngineWorkerStatusTest {
         assertTrue(result.containsKey(ipPort2));
 
         EngineWorkerStatus.MODEL_ROLE_WORKER_STATUS.getDecodeStatusMap().clear();
+    }
+
+    @Test
+    void should_visit_registered_endpoints_without_materializing_result() {
+        String matching = "127.0.0.1:8080";
+        String filtered = "127.0.0.1:8081";
+        EngineWorkerStatus.MODEL_ROLE_WORKER_STATUS.getDecodeStatusMap().clear();
+        EngineWorkerStatus.MODEL_ROLE_WORKER_STATUS.getDecodeStatusMap().put(matching, workerStatus1);
+        EngineWorkerStatus.MODEL_ROLE_WORKER_STATUS.getDecodeStatusMap().put(filtered, workerStatus2);
+        workerStatus1.setIp("127.0.0.1");
+        workerStatus1.setPort(8080);
+        workerStatus2.setIp("127.0.0.1");
+        workerStatus2.setPort(8081);
+        registry.ensureDecodeEndpoint(matching, workerStatus1);
+        registry.ensureDecodeEndpoint(filtered, workerStatus2);
+        AtomicInteger visited = new AtomicInteger();
+
+        int count = engineWorkerStatus.forEachModelWorkerEndpoint(
+                RoleType.DECODE, "group1", (ipPort, endpoint) -> {
+                    assertEquals(matching, ipPort);
+                    visited.incrementAndGet();
+                });
+
+        assertEquals(1, count);
+        assertEquals(1, visited.get());
+        EngineWorkerStatus.MODEL_ROLE_WORKER_STATUS.getDecodeStatusMap().remove(filtered);
+        assertEquals(2, engineWorkerStatus.getModelWorkerCapacity(RoleType.DECODE));
+        EngineWorkerStatus.MODEL_ROLE_WORKER_STATUS.getDecodeStatusMap().clear();
+    }
+
+    @Test
+    void should_resolve_pd_fusion_and_vit_from_role_specific_registries() {
+        assertRoleEndpoint(RoleType.PDFUSION, "127.0.0.1:8101");
+        assertRoleEndpoint(RoleType.VIT, "127.0.0.1:8102");
+    }
+
+    private void assertRoleEndpoint(RoleType roleType, String ipPort) {
+        WorkerStatus status = new WorkerStatus();
+        status.setRole(roleType);
+        status.setIp("127.0.0.1");
+        status.setPort(Integer.parseInt(ipPort.substring(ipPort.lastIndexOf(':') + 1)));
+        status.setAlive(true);
+        EngineWorkerStatus.MODEL_ROLE_WORKER_STATUS.getRoleStatusMap(roleType).put(ipPort, status);
+        var registered = registry.ensureEndpoint(roleType, ipPort, status);
+
+        var selected = engineWorkerStatus.selectModelWorkerStatus(roleType, null);
+
+        assertEquals(1, selected.size());
+        assertSame(registered, selected.get(ipPort));
     }
 }
