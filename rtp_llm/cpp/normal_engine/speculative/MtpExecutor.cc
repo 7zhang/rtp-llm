@@ -26,6 +26,7 @@
 #endif
 #include "autil/TimeUtility.h"
 #include <algorithm>
+#include <exception>
 #include <limits>
 #include <cstdlib>
 #include <memory>
@@ -480,7 +481,7 @@ bool isCpContextRequest(const ParallelismConfig& parallelism_config, const GptMo
 }
 
 std::vector<int64_t>
-collectMtpLogprobRows(const StreamGroups& stream_groups, int64_t positions_per_batch, int64_t logits_rows) {
+collectMtpPrefillLogprobRows(const StreamGroups& stream_groups, int64_t positions_per_batch, int64_t logits_rows) {
     RTP_LLM_CHECK(positions_per_batch > 0);
     std::vector<int64_t> requested_rows;
     requested_rows.reserve(logits_rows);
@@ -503,9 +504,8 @@ collectMtpLogprobRows(const StreamGroups& stream_groups, int64_t positions_per_b
                             row_offset,
                             logits_rows);
 
-    // Undefined source_row_indices is the zero-copy identity mapping. This is
-    // important when every request asks for logprobs: do not duplicate the
-    // full raw logits merely to create a compact row set.
+    // Prefill finalizes before leaving the step, so mixed rows may be compacted
+    // here. Preserve the zero-copy identity mapping when every row is used.
     return every_row_used ? std::vector<int64_t>{} : requested_rows;
 }
 
@@ -708,6 +708,15 @@ MtpTargetLogprobs captureMtpTargetLogprobs(const torch::Tensor&        logits,
         selectMtpTargetLogprobRows(result, captured_dense_row_indices);
     }
     return result;
+}
+
+MtpTargetLogprobs
+captureMtpDecodeTargetLogprobs(const torch::Tensor& logits, int64_t max_top_logprobs, int64_t real_vocab_size) {
+    // Acceptance is the first point where decode knows both which streams
+    // requested logprobs and which of their P+1 rows were emitted. Deferring
+    // selection avoids a pre-acceptance [R,V] index_select for dense mixed
+    // batches while preserving the original LM-head storage as an O(1) view.
+    return captureMtpTargetLogprobs(logits, max_top_logprobs, real_vocab_size);
 }
 
 MtpTargetLogprobs computeMtpTargetLogprobs(const torch::Tensor&        logits,
@@ -1573,11 +1582,12 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
             model_input.last_hidden_states = model_output.all_hidden_states;
         } else {
             if (stream_groups.needReturnLogProbs()) {
-                target_logprobs = computeMtpTargetLogprobs(
-                    model_output.logits,
-                    stream_groups.maxTopLogProbs(),
-                    static_cast<int64_t>(vocab_size_),
-                    collectMtpLogprobRows(stream_groups, /*positions_per_batch=*/1, model_output.logits.size(0)));
+                target_logprobs = computeMtpTargetLogprobs(model_output.logits,
+                                                           stream_groups.maxTopLogProbs(),
+                                                           static_cast<int64_t>(vocab_size_),
+                                                           collectMtpPrefillLogprobRows(stream_groups,
+                                                                                        /*positions_per_batch=*/1,
+                                                                                        model_output.logits.size(0)));
             }
             CHECK_AND_RETURN_REF(sampler_input,
                                  batch_stream_processor_->gatherSamplerInput(stream_groups, model_input, model_output));
@@ -1871,6 +1881,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     SamplerOutput                         draft_sampler_output;
     speculative::SpeculativeSamplerOutput speculative_sampler_output;
     MtpTargetLogprobs                     target_logprobs;
+    std::shared_ptr<MtpTargetLogprobs>    early_target_logprobs_finalize_state;
 
     // Placeholders shared across draftModelDecode and the post-rejection update.
     torch::Tensor              draft_token_probs_d_t;
@@ -1987,16 +1998,12 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     }
 
     if (isTpRank0() && !model_input.is_fake_stream && stream_groups.needReturnLogProbs()) {
-        // Keep every possible target position for requesting streams before
-        // sampler-side mutation. Mixed batches copy those rows into independent
-        // compact storage now; all-request batches retain the zero-copy view.
-        // Full-vocabulary reductions remain deferred until acceptance is known.
-        auto captured_dense_rows =
-            collectMtpLogprobRows(stream_groups, static_cast<int64_t>(propose_step_ + 1), model_output.logits.size(0));
-        target_logprobs = captureMtpTargetLogprobs(model_output.logits,
-                                                   stream_groups.maxTopLogProbs(),
-                                                   static_cast<int64_t>(vocab_size_),
-                                                   captured_dense_rows);
+        // Keep the complete dense target layout as an O(1) view for every
+        // decode batch, including mixed batches. Acceptance later selects only
+        // emitted rows from requesting streams. Compacting here would make a
+        // 127/128 mixed batch duplicate nearly the entire [R,V] LM-head output.
+        target_logprobs = captureMtpDecodeTargetLogprobs(
+            model_output.logits, stream_groups.maxTopLogProbs(), static_cast<int64_t>(vocab_size_));
     }
 
     // trick: update draft sampler output after spec decode to avoid kernel launch overhead
@@ -2160,31 +2167,82 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             releaseAllModelBuffers();
             return absl::OkStatus();
         }
-        int64_t start_time_us      = autil::TimeUtility::currentTimeInMicroSeconds();
-        draft_prefill_model_output = runDraftPrefillForward(model_input);
+
+        if (!warm_up_ && shouldFinalizeMtpTargetLogprobsEarly(useStreamAsync(), target_logprobs)) {
+            early_target_logprobs_finalize_state = launchEarlyMtpTargetLogprobsFinalize(
+                stream_groups, speculative_sampler_output, std::move(target_logprobs), rejection_event);
+            RTP_LLM_CHECK(early_target_logprobs_finalize_state != nullptr);
+
+            // Rejection sampling and updateDecodePostDraftModelInput have
+            // consumed the target logits. The early payload now owns the view
+            // needed by its worker, so drop this second owner before draft
+            // forward. Once the worker finishes its recorded-stream use, the
+            // allocator can recycle the complete LM-head block for draft work.
+            model_output.logits = torch::Tensor();
+            RTP_LLM_CHECK(!model_output.logits.defined());
+        }
+
+        int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+        try {
+            draft_prefill_model_output = runDraftPrefillForward(model_input);
+        } catch (...) {
+            auto forward_exception = std::current_exception();
+            try {
+                finishEarlyMtpTargetLogprobsFinalize(early_target_logprobs_finalize_state, target_logprobs);
+            } catch (const std::exception& e) {
+                RTP_LLM_LOG_ERROR("early MTP target-logprob finalize also failed while unwinding draft-prefill "
+                                  "forward: %s",
+                                  e.what());
+            } catch (...) {
+                RTP_LLM_LOG_ERROR(
+                    "early MTP target-logprob finalize also failed with an unknown exception while unwinding "
+                    "draft-prefill forward");
+            }
+            std::rethrow_exception(forward_exception);
+        }
         model_forward_us += autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
     }
 
     if (!isTpRank0() || warm_up_ || streams.size() == 0 || model_input.is_fake_stream) {
+        finishEarlyMtpTargetLogprobsFinalize(early_target_logprobs_finalize_state, target_logprobs);
         releaseAllModelBuffers();
         return absl::OkStatus();
     }
 
     // draft model sample
     SamplerOutput draft_prefill_sampler_output;
-    {
-        RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(draft_model_sample)");
-        auto fast_topk_sampler_output          = fast_topk_sampler_->forward(draft_prefill_model_output.logits);
-        draft_prefill_sampler_output.all_probs = fast_topk_sampler_output.all_probs;
-        draft_prefill_sampler_output.token_ids = fast_topk_sampler_output.token_ids;
+    try {
+        {
+            RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(draft_model_sample)");
+            auto fast_topk_sampler_output          = fast_topk_sampler_->forward(draft_prefill_model_output.logits);
+            draft_prefill_sampler_output.all_probs = fast_topk_sampler_output.all_probs;
+            draft_prefill_sampler_output.token_ids = fast_topk_sampler_output.token_ids;
+        }
+
+        // Record after draft_model_sample so worker all_probs/token_ids reads wait
+        // on the earliest valid point, not metrics or dispatch slicing.
+        if (useStreamAsync()) {
+            draft_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+            draft_event->record(cuda_graph::graphGetCurrentStream());
+        }
+    } catch (...) {
+        auto draft_exception = std::current_exception();
+        try {
+            finishEarlyMtpTargetLogprobsFinalize(early_target_logprobs_finalize_state, target_logprobs);
+        } catch (const std::exception& e) {
+            RTP_LLM_LOG_ERROR("early MTP target-logprob finalize also failed while unwinding draft sampling: %s",
+                              e.what());
+        } catch (...) {
+            RTP_LLM_LOG_ERROR(
+                "early MTP target-logprob finalize also failed with an unknown exception while unwinding draft sampling");
+        }
+        std::rethrow_exception(draft_exception);
     }
 
-    // Record after draft_model_sample so worker all_probs/token_ids reads wait
-    // on the earliest valid point, not metrics or dispatch slicing.
-    if (useStreamAsync()) {
-        draft_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
-        draft_event->record(cuda_graph::graphGetCurrentStream());
-    }
+    // The early worker has overlapped both draft-prefill forward and its top-k.
+    // Recover the compact payload before the regular bookkeeping worker uses
+    // the same single-slot runner.
+    finishEarlyMtpTargetLogprobsFinalize(early_target_logprobs_finalize_state, target_logprobs);
 
     if (metrics_reporter_) {
         collectDecodeMetrics(stream_groups, accept_len_ready_event, speculative_sampler_output, metrics_collector);
@@ -2724,6 +2782,61 @@ void MtpExecutor::collectDecodeMetrics(const StreamGroups&                      
     sp_engine_collector.spec_steps               = propose_step_;
 }
 
+std::shared_ptr<MtpTargetLogprobs> MtpExecutor::launchEarlyMtpTargetLogprobsFinalize(
+    const StreamGroups&                          stream_groups,
+    const speculative::SpeculativeSamplerOutput& speculative_sampler_output,
+    MtpTargetLogprobs                            target_logprobs,
+    std::shared_ptr<torch::Event>                rejection_event) {
+    RTP_LLM_CHECK(target_logprobs.retainsFullLmHeadStorage());
+
+    auto  state              = std::make_shared<MtpTargetLogprobs>(std::move(target_logprobs));
+    auto* processor          = batch_stream_processor_.get();
+    auto  stream_groups_copy = stream_groups;
+    auto  spec_decode_copy   = speculative_sampler_output;
+
+    spec_bookkeeping_runner_.launch([processor,
+                                     state,
+                                     stream_groups_copy = std::move(stream_groups_copy),
+                                     spec_decode_copy   = std::move(spec_decode_copy),
+                                     rejection_event    = std::move(rejection_event)]() mutable {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(early_target_logprobs_finalize_worker)");
+        if (rejection_event) {
+            rejection_event->block(cuda_graph::graphGetCurrentStream());
+        }
+        processor->finalizeDecodeTargetLogprobs(stream_groups_copy, spec_decode_copy, *state);
+
+        // Clearing raw_logits after enqueue is storage-safe via recordStream,
+        // but the caching allocator cannot reuse that full block until the
+        // recorded worker-stream use completes. Make completion part of this
+        // front task while the main thread executes draft-prefill forward.
+        cuda_graph::graphGetCurrentStream().synchronize();
+        RTP_LLM_CHECK(state->finalized());
+        RTP_LLM_CHECK(!state->retainsFullLmHeadStorage());
+    });
+    return state;
+}
+
+void MtpExecutor::finishEarlyMtpTargetLogprobsFinalize(std::shared_ptr<MtpTargetLogprobs>& early_finalize_state,
+                                                       MtpTargetLogprobs&                  target_logprobs) {
+    if (!early_finalize_state) {
+        return;
+    }
+
+    try {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(wait_early_target_logprobs_finalize)");
+        spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
+        RTP_LLM_CHECK(early_finalize_state->finalized());
+        RTP_LLM_CHECK(!early_finalize_state->retainsFullLmHeadStorage());
+        target_logprobs = std::move(*early_finalize_state);
+        early_finalize_state.reset();
+    } catch (...) {
+        // Do not let an exception leave the complete LM-head owner attached to
+        // a state object that outlives this decode step.
+        early_finalize_state.reset();
+        throw;
+    }
+}
+
 absl::Status MtpExecutor::dispatchDecodeOutput(const StreamGroups&                          stream_groups,
                                                const std::list<GenerateStreamPtr>&          streams,
                                                const speculative::SpeculativeSamplerOutput& speculative_sampler_output,
@@ -2767,16 +2880,6 @@ void MtpExecutor::releaseAllModelBuffers() {
     if (sp_prefill_draft_model_) {
         sp_prefill_draft_model_->releaseBuffers();
     }
-}
-
-void MtpExecutor::syncPendingAsyncLogprobBookkeeping() {
-    if (!pending_async_logprob_bookkeeping_) {
-        return;
-    }
-    RTP_LLM_CHECK(useStreamAsync());
-    RTP_LLM_PROFILE_SCOPE("executor.mtp.wait_pending_async_logprob_bookkeeping");
-    spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
-    pending_async_logprob_bookkeeping_ = false;
 }
 
 void MtpExecutor::prepareStreams(const std::list<GenerateStreamPtr>& streams,
@@ -2831,13 +2934,6 @@ absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams, i
         tps_reporter_.makeActiveGuard(metrics_reporter_ && isTpRank0() && !warm_up_ && !streams.empty());
     auto wall_tps_active_guard =
         wall_tps_reporter_.makeActiveGuard(metrics_reporter_ && isTpRank0() && !warm_up_ && !streams.empty());
-
-    // An all-request identity payload may outlive the stream that requested it.
-    // Release its full target LM-head output before prepareStreams and any
-    // PDFUSION prefill/draft/target forward can allocate the next step's model
-    // tensors. Mixed batches carry independent compact storage and skip this
-    // process-entry worker sync.
-    syncPendingAsyncLogprobBookkeeping();
 
     std::list<GenerateStreamPtr> prefill_streams;
     std::list<GenerateStreamPtr> decode_streams;
@@ -3260,8 +3356,6 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
                                               std::shared_ptr<torch::Event>                draft_event) {
     RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(dispatch_output_async)");
 
-    const bool payload_retains_full_lm_head_storage = target_logprobs.requiresAsyncLmHeadReleaseSync();
-
     const auto& accept_len_gpu_all     = spec_decode_output.accept_len;
     const auto& accept_tokens_gpu_all  = spec_decode_output.accept_tokens;
     const auto& propose_tokens_gpu_all = draft_prefill_output.sampler_output.token_ids;
@@ -3415,10 +3509,6 @@ absl::Status MtpExecutor::dispatchDecodeAsync(const StreamGroups&               
             stream->setPendingSwapDoneEvent(std::static_pointer_cast<void>(event));
         }
     });
-
-    // Launch succeeded. The next target forward must release this exact
-    // previous payload first; the requesting stream may no longer be scheduled.
-    pending_async_logprob_bookkeeping_ = payload_retains_full_lm_head_storage;
 
     return absl::OkStatus();
 }

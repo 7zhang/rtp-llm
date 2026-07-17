@@ -232,6 +232,114 @@ class DashScGrpcRequestTest(TestCase):
         self.assertTrue(sp.return_logprobs)
         self.assertEqual(sp.top_logprobs, 2)
 
+    def test_parameter_n_fallback_preserves_non_logprobs_backend_fanout(
+        self,
+    ) -> None:
+        for param_name in ("n", "num_return_sequences"):
+            for value in (0, 1):
+                for return_logprobs in (False, True):
+                    with self.subTest(
+                        param_name=param_name,
+                        value=value,
+                        return_logprobs=return_logprobs,
+                    ):
+                        req = predict_v2_pb2.ModelInferRequest()
+                        req.parameters[param_name].int64_param = value
+                        if return_logprobs:
+                            req.parameters["logprobs"].bool_param = True
+
+                        sp = parse_sampling_params(req)
+                        config = sp.to_generate_config()
+                        expected = value if return_logprobs else 0
+
+                        self.assertEqual(sp.num_return_sequences, expected)
+                        self.assertEqual(config.num_return_sequences, expected)
+                        self.assertIs(sp.return_logprobs, return_logprobs)
+                        self.assertIs(config.return_logprobs, return_logprobs)
+
+    def test_parameter_n_defaults_do_not_enable_backend_fanout(self) -> None:
+        for return_logprobs in (False, True):
+            with self.subTest(return_logprobs=return_logprobs):
+                req = predict_v2_pb2.ModelInferRequest()
+                if return_logprobs:
+                    req.parameters["logprobs"].bool_param = True
+
+                sp = parse_sampling_params(req)
+                config = sp.to_generate_config()
+
+                self.assertEqual(sp.num_return_sequences, 0)
+                self.assertEqual(config.num_return_sequences, 0)
+
+    def test_parameter_n_greater_than_one_is_rejected_for_single_result_wire(
+        self,
+    ) -> None:
+        for param_name in ("n", "num_return_sequences"):
+            for return_logprobs in (False, True):
+                with self.subTest(
+                    param_name=param_name,
+                    return_logprobs=return_logprobs,
+                ):
+                    req = predict_v2_pb2.ModelInferRequest()
+                    req.parameters[param_name].int64_param = 2
+                    if return_logprobs:
+                        req.parameters["logprobs"].bool_param = True
+
+                    with self.assertRaisesRegex(
+                        DashScParameterError,
+                        "DashScope response does not support n > 1",
+                    ):
+                        parse_sampling_params(req)
+
+    def test_parameter_n_alias_conflict_is_rejected(self) -> None:
+        for return_logprobs in (False, True):
+            with self.subTest(return_logprobs=return_logprobs):
+                req = predict_v2_pb2.ModelInferRequest()
+                req.parameters["n"].int64_param = 1
+                req.parameters["num_return_sequences"].int64_param = 0
+                if return_logprobs:
+                    req.parameters["logprobs"].bool_param = True
+
+                with self.assertRaisesRegex(
+                    DashScParameterError,
+                    "conflicting n and num_return_sequences parameters",
+                ):
+                    parse_sampling_params(req)
+
+    def test_input_tensor_n_keeps_existing_mapping_and_logprobs_validation(
+        self,
+    ) -> None:
+        for tensor_name in ("n", "num_return_sequences"):
+            for value in (0, 1, 2):
+                for return_logprobs in (False, True):
+                    with self.subTest(
+                        tensor_name=tensor_name,
+                        value=value,
+                        return_logprobs=return_logprobs,
+                    ):
+                        req = predict_v2_pb2.ModelInferRequest()
+                        _add_tensor(
+                            req,
+                            tensor_name,
+                            "INT32",
+                            [1],
+                            struct.pack("<i", value),
+                        )
+                        if return_logprobs:
+                            req.parameters["logprobs"].bool_param = True
+
+                        if return_logprobs and value > 1:
+                            with self.assertRaisesRegex(
+                                DashScParameterError,
+                                "logprobs does not support n > 1",
+                            ):
+                                parse_sampling_params(req)
+                            continue
+
+                        sp = parse_sampling_params(req)
+                        config = sp.to_generate_config()
+                        self.assertEqual(sp.num_return_sequences, value)
+                        self.assertEqual(config.num_return_sequences, value)
+
     def test_logprobs_validation(self) -> None:
         invalid_cases = []
 

@@ -111,13 +111,20 @@ protected:
     void            broadcastPostRejectionInputs(GptModelInputs& model_input, const StreamGroups& stream_groups);
     GptModelOutputs runDraftPrefillForward(GptModelInputs& model_input);
     SpecLogitsVerifyRunner::LaunchResult
-                 buildSpecLogitsVerifyInline(const std::list<GenerateStreamPtr>& streams,
-                                             const torch::Tensor&                draft_tokens,
-                                             std::shared_ptr<torch::Event>       draft_tokens_ready_event);
-    void         collectDecodeMetrics(const StreamGroups&                          stream_groups,
-                                      torch::Event&                                accept_len_ready_event,
-                                      const speculative::SpeculativeSamplerOutput& speculative_sampler_output,
-                                      MtpMetricsCollector&                         metrics_collector);
+         buildSpecLogitsVerifyInline(const std::list<GenerateStreamPtr>& streams,
+                                     const torch::Tensor&                draft_tokens,
+                                     std::shared_ptr<torch::Event>       draft_tokens_ready_event);
+    void collectDecodeMetrics(const StreamGroups&                          stream_groups,
+                              torch::Event&                                accept_len_ready_event,
+                              const speculative::SpeculativeSamplerOutput& speculative_sampler_output,
+                              MtpMetricsCollector&                         metrics_collector);
+    std::shared_ptr<MtpTargetLogprobs>
+                 launchEarlyMtpTargetLogprobsFinalize(const StreamGroups&                          stream_groups,
+                                                      const speculative::SpeculativeSamplerOutput& speculative_sampler_output,
+                                                      MtpTargetLogprobs                            target_logprobs,
+                                                      std::shared_ptr<torch::Event>                rejection_event);
+    void         finishEarlyMtpTargetLogprobsFinalize(std::shared_ptr<MtpTargetLogprobs>& early_finalize_state,
+                                                      MtpTargetLogprobs&                  target_logprobs);
     absl::Status dispatchDecodeOutput(const StreamGroups&                          stream_groups,
                                       const std::list<GenerateStreamPtr>&          streams,
                                       const speculative::SpeculativeSamplerOutput& speculative_sampler_output,
@@ -189,12 +196,6 @@ protected:
 
     void releaseAllModelBuffers();
 
-    // All-request decode logprob bookkeeping aliases the full target LM-head
-    // output. Before another target forward can allocate logits, wait only
-    // when the previous async payload retained that large storage; compact
-    // mixed-batch payloads do not set the pending flag.
-    void syncPendingAsyncLogprobBookkeeping();
-
 private:
     std::unique_ptr<ModelBase>                                               model_;
     std::unique_ptr<Sampler>                                                 sampler_;
@@ -255,10 +256,6 @@ private:
     // Bookkeeping worker for stream-async decode dispatch. It owns a CUDA
     // stream + thread and runs D2H/specUpdate/KV release off the main thread.
     AsyncRunner spec_bookkeeping_runner_;
-
-    // Main executor thread only. Track the previous payload rather than the
-    // current stream list because its requesting stream may already be gone.
-    bool pending_async_logprob_bookkeeping_ = false;
 
     std::atomic<bool> stop_requested_{false};
 };

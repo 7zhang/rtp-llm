@@ -48,6 +48,10 @@ from rtp_llm.openai.renderers.qwen3_code_renderer import Qwen3CoderRenderer
 from rtp_llm.openai.renderers.qwen_reasoning_tool_renderer import (
     QwenReasoningToolRenderer,
 )
+from rtp_llm.openai.renderers.qwen_renderer import QwenRenderer, QwenStreamStatusSync
+from rtp_llm.openai.renderers.reasoning_tool_base_renderer import (
+    ReasoningToolBaseRenderer,
+)
 from rtp_llm.ops import FfnDisAggregateConfig, PDSepConfig, SpecialTokens
 from rtp_llm.server.backend_rpc_server_visitor import BackendRPCServerVisitor
 from rtp_llm.test.utils.stream_util import (
@@ -465,6 +469,14 @@ class CompactLogprobTestTokenizer:
         13: "A\ufffd",
         14: " A",
         15: " ",
+        20: "think",
+        21: "-",
+        22: "prefix",
+        23: "</",
+        24: "think>",
+        25: "A",
+        26: "B",
+        30: "X",
     }
 
     def __init__(self):
@@ -506,6 +518,45 @@ def create_compact_logprob_renderer(stop_word_ids=None):
     )
 
 
+def create_compact_qwen_renderer():
+    renderer = QwenRenderer.__new__(QwenRenderer)
+    custom_renderer.CustomChatRenderer.__init__(
+        renderer,
+        CompactLogprobTestTokenizer(),
+        custom_renderer.RendererParams(
+            model_type="compact_qwen_test",
+            max_seq_len=128,
+            eos_token_id=99,
+            stop_word_ids_list=[],
+        ),
+        GenerateEnvConfig(),
+    )
+    return renderer
+
+
+def create_compact_reasoning_logprob_renderer():
+    class TestReasoningRenderer(ReasoningToolBaseRenderer):
+        def _setup_chat_template(self):
+            self.chat_template = "test"
+
+        def in_think_mode(self, request: ChatCompletionRequest):
+            return True
+
+    generate_env_config = GenerateEnvConfig()
+    generate_env_config.think_mode = 1
+    generate_env_config.think_end_tag = "</think>"
+    return TestReasoningRenderer(
+        CompactLogprobTestTokenizer(),
+        custom_renderer.RendererParams(
+            model_type="compact_reasoning_logprob_test",
+            max_seq_len=128,
+            eos_token_id=99,
+            stop_word_ids_list=[],
+        ),
+        generate_env_config,
+    )
+
+
 def create_compact_logprob_internvl_renderer():
     return InternVLRenderer(
         CompactLogprobTestTokenizer(),
@@ -537,6 +588,63 @@ def make_compact_logprob_output(
         ),
         aux_info=AuxInfo(input_len=3, output_len=len(token_ids)),
     )
+
+
+def make_sync_logprob_payload(token_ids, top_k):
+    output_ids = torch.tensor([token_ids], dtype=torch.int32)
+    token_logprobs = torch.tensor(
+        [[-token_id / 100.0 for token_id in token_ids]], dtype=torch.float32
+    )
+    if top_k == 0:
+        top_token_ids = torch.empty((1, len(token_ids), 0), dtype=torch.int32)
+        top_logprobs = torch.empty((1, len(token_ids), 0), dtype=torch.float32)
+    else:
+        top_token_ids = torch.tensor(
+            [[[token_id, 30] for token_id in token_ids]], dtype=torch.int32
+        )
+        top_logprobs = torch.tensor(
+            [[[-token_id / 100.0, -9.0] for token_id in token_ids]],
+            dtype=torch.float32,
+        )
+    return (
+        [token_logprobs],
+        [top_token_ids],
+        [top_logprobs],
+        [output_ids],
+    )
+
+
+async def compact_reasoning_output_generator(chunks, top_k=None):
+    output_len = 0
+    for index, token_ids in enumerate(chunks):
+        output_len += len(token_ids)
+        output = GenerateOutput(
+            output_ids=torch.tensor([token_ids], dtype=torch.int32),
+            finished=index == len(chunks) - 1,
+            aux_info=AuxInfo(input_len=3, output_len=output_len, reuse_len=0),
+        )
+        if top_k is not None:
+            output.token_logprobs = torch.tensor(
+                [[-token_id / 100.0 for token_id in token_ids]],
+                dtype=torch.float32,
+            )
+            if top_k == 0:
+                output.top_logprob_token_ids = torch.empty(
+                    (1, len(token_ids), 0), dtype=torch.int32
+                )
+                output.top_logprobs = torch.empty(
+                    (1, len(token_ids), 0), dtype=torch.float32
+                )
+            else:
+                output.top_logprob_token_ids = torch.tensor(
+                    [[[token_id, 30] for token_id in token_ids]],
+                    dtype=torch.int32,
+                )
+                output.top_logprobs = torch.tensor(
+                    [[[-token_id / 100.0, -9.0] for token_id in token_ids]],
+                    dtype=torch.float32,
+                )
+        yield GenerateOutputs(generate_outputs=[output])
 
 
 class OpenaiResponseTest(IsolatedAsyncioTestCase):
@@ -915,6 +1023,626 @@ class OpenaiResponseTest(IsolatedAsyncioTestCase):
         self.assertEqual(delta.output_str, "AB")
         self.assertEqual(len(delta.logprobs), 2)
         self.assertEqual(status.output_ids, [1, 2])
+
+    def test_sync_public_entries_accept_compact_non_logprob_abi(self):
+        renderer = create_compact_logprob_renderer()
+        request = ChatCompletionRequest(messages=[], logprobs=False)
+        output_ids_list = [torch.tensor([[1]], dtype=torch.int32)]
+
+        streaming_status = [custom_renderer.StreamStatusSync(request)]
+        streaming_json = renderer.render_stream_response_refactor(
+            streaming_status,
+            [3],
+            [1],
+            [0],
+            output_ids_list,
+            16,
+            [],
+            True,
+        )
+        streaming_choice = json.loads(streaming_json)["choices"][0]
+        self.assertEqual(streaming_choice["delta"]["content"], "A")
+        self.assertNotIn("logprobs", streaming_choice)
+        streaming_flush = renderer.render_stream_response_flush(
+            streaming_status, [3], [1], [0], [], True
+        )
+        self.assertEqual(
+            json.loads(streaming_flush)["choices"][0]["delta"]["content"], ""
+        )
+
+        blocking_status = [custom_renderer.StreamStatusSync(request)]
+        blocking_response = renderer.render_stream_response_blocking(
+            blocking_status,
+            [3],
+            [1],
+            [0],
+            output_ids_list,
+            16,
+            [],
+            False,
+        )
+        self.assertEqual(blocking_response.choices[0].delta.content, "A")
+        self.assertIsNone(blocking_response.choices[0].logprobs)
+        blocking_flush = renderer.render_stream_response_flush_blocking(
+            blocking_status, [3], [1], [0], output_ids_list, [], False
+        )
+        self.assertEqual(blocking_flush.choices[0].delta.content, "")
+
+    def test_sync_public_entries_keep_extended_logprob_abi(self):
+        renderer = create_compact_logprob_renderer()
+        request = ChatCompletionRequest(messages=[], logprobs=True, top_logprobs=0)
+        output_ids_list = [torch.tensor([[1]], dtype=torch.int32)]
+        token_logprobs_list = [torch.tensor([[-0.1]], dtype=torch.float32)]
+        top_token_ids_list = [None]
+        top_logprobs_list = [None]
+
+        streaming_status = [custom_renderer.StreamStatusSync(request)]
+        streaming_json = renderer.render_stream_response_refactor(
+            streaming_status,
+            [3],
+            [1],
+            [0],
+            token_logprobs_list,
+            top_token_ids_list,
+            top_logprobs_list,
+            output_ids_list,
+            16,
+            [],
+            True,
+        )
+        streaming_logprobs = json.loads(streaming_json)["choices"][0]["logprobs"]
+        self.assertEqual(
+            [item["token"] for item in streaming_logprobs["content"]], ["A"]
+        )
+        streaming_flush = renderer.render_stream_response_flush(
+            streaming_status,
+            [3],
+            [1],
+            [0],
+            token_logprobs_list,
+            top_token_ids_list,
+            top_logprobs_list,
+            output_ids_list,
+            [],
+            True,
+        )
+        self.assertNotIn("logprobs", json.loads(streaming_flush)["choices"][0])
+
+        blocking_status = [custom_renderer.StreamStatusSync(request)]
+        blocking_response = renderer.render_stream_response_blocking(
+            blocking_status,
+            [3],
+            [1],
+            [0],
+            token_logprobs_list,
+            top_token_ids_list,
+            top_logprobs_list,
+            output_ids_list,
+            16,
+            [],
+            False,
+        )
+        self.assertEqual(
+            [item.token for item in blocking_response.choices[0].logprobs.content],
+            ["A"],
+        )
+        blocking_flush = renderer.render_stream_response_flush_blocking(
+            blocking_status, [3], [1], [0], [], False
+        )
+        self.assertIsNone(blocking_flush.choices[0].logprobs)
+
+    async def test_reasoning_logprobs_async_stream_keeps_raw_content_aligned(self):
+        chunks = [[20, 21], [22, 23], [24, 25, 26]]
+        expected_tokens = [
+            "think",
+            "-",
+            "prefix",
+            "</",
+            "think>",
+            "A",
+            "B",
+        ]
+        expected_content = "think-prefix</think>AB"
+
+        for top_k in (0, 2):
+            with self.subTest(top_k=top_k):
+                renderer = create_compact_reasoning_logprob_renderer()
+                request = ChatCompletionRequest(
+                    messages=[], stream=True, logprobs=True, top_logprobs=top_k
+                )
+                generate_config = GenerateConfig(
+                    is_streaming=True,
+                    max_new_tokens=32,
+                    return_logprobs=True,
+                    top_logprobs=top_k,
+                )
+                responses = []
+                async for response in renderer.render_response_stream(
+                    compact_reasoning_output_generator(chunks, top_k),
+                    request,
+                    generate_config,
+                ):
+                    responses.append(response)
+
+                content_parts = []
+                logprob_records = []
+                for response in responses:
+                    choice = response.choices[0]
+                    content_parts.append(choice.delta.content or "")
+                    self.assertIsNone(choice.delta.reasoning_content)
+                    if choice.logprobs is not None:
+                        logprob_records.extend(choice.logprobs.content)
+
+                self.assertEqual("".join(content_parts), expected_content)
+                self.assertEqual(
+                    [record.token for record in logprob_records], expected_tokens
+                )
+                self.assertEqual(
+                    "".join(record.token for record in logprob_records),
+                    expected_content,
+                )
+                self.assertTrue(
+                    all(len(record.top_logprobs) == top_k for record in logprob_records)
+                )
+                self.assertEqual(
+                    responses[-1].usage.completion_tokens_details.reasoning_tokens,
+                    0,
+                )
+
+    async def test_reasoning_logprobs_async_collect_length_in_thinking(self):
+        chunks = [[20, 21], [22, 20], [21, 22], [20, 21]]
+        expected_tokens = [
+            "think",
+            "-",
+            "prefix",
+            "think",
+            "-",
+            "prefix",
+            "think",
+            "-",
+        ]
+        expected_content = "".join(expected_tokens)
+        renderer = create_compact_reasoning_logprob_renderer()
+        request = ChatCompletionRequest(
+            messages=[], stream=False, logprobs=True, top_logprobs=2
+        )
+        generate_config = GenerateConfig(
+            is_streaming=True,
+            max_new_tokens=8,
+            return_logprobs=True,
+            top_logprobs=2,
+        )
+
+        complete = await OpenaiEndpoint._collect_complete_response(
+            renderer.render_response_stream(
+                compact_reasoning_output_generator(chunks, 2),
+                request,
+                generate_config,
+            ),
+            debug_info=None,
+        )
+
+        choice = complete.choices[0]
+        self.assertEqual(choice.message.content, expected_content)
+        self.assertIsNone(choice.message.reasoning_content)
+        self.assertEqual(
+            [record.token for record in choice.logprobs.content], expected_tokens
+        )
+        self.assertEqual(len(choice.logprobs.content), 8)
+        self.assertEqual(choice.finish_reason, FinisheReason.length)
+        self.assertEqual(
+            complete.usage.completion_tokens_details.reasoning_tokens,
+            0,
+        )
+
+    async def test_reasoning_logprobs_async_collect_keeps_raw_content_aligned(self):
+        chunks = [[20, 21], [22, 23], [24, 25, 26]]
+        expected_tokens = [
+            "think",
+            "-",
+            "prefix",
+            "</",
+            "think>",
+            "A",
+            "B",
+        ]
+        expected_content = "think-prefix</think>AB"
+
+        for top_k in (0, 2):
+            with self.subTest(top_k=top_k):
+                renderer = create_compact_reasoning_logprob_renderer()
+                request = ChatCompletionRequest(
+                    messages=[], stream=False, logprobs=True, top_logprobs=top_k
+                )
+                generate_config = GenerateConfig(
+                    # The OpenAI endpoint keeps the backend incremental for
+                    # logprobs even when the client requests one response.
+                    is_streaming=True,
+                    max_new_tokens=32,
+                    return_logprobs=True,
+                    top_logprobs=top_k,
+                )
+                complete = await OpenaiEndpoint._collect_complete_response(
+                    renderer.render_response_stream(
+                        compact_reasoning_output_generator(chunks, top_k),
+                        request,
+                        generate_config,
+                    ),
+                    debug_info=None,
+                )
+
+                choice = complete.choices[0]
+                self.assertEqual(choice.message.content, expected_content)
+                self.assertIsNone(choice.message.reasoning_content)
+                logprob_records = choice.logprobs.content
+                self.assertEqual(
+                    [record.token for record in logprob_records], expected_tokens
+                )
+                self.assertEqual(
+                    "".join(record.token for record in logprob_records),
+                    expected_content,
+                )
+                self.assertTrue(
+                    all(len(record.top_logprobs) == top_k for record in logprob_records)
+                )
+                self.assertEqual(
+                    complete.usage.completion_tokens_details.reasoning_tokens,
+                    0,
+                )
+
+    async def test_reasoning_async_uses_extra_config_logprobs_for_raw_content(self):
+        generate_config = GenerateConfig(
+            is_streaming=True,
+            max_new_tokens=32,
+            return_logprobs=True,
+            top_logprobs=0,
+        )
+        request = ChatCompletionRequest(
+            messages=[], stream=False, extra_configs=generate_config
+        )
+        renderer = create_compact_reasoning_logprob_renderer()
+        complete = await OpenaiEndpoint._collect_complete_response(
+            renderer.render_response_stream(
+                compact_reasoning_output_generator(
+                    [[20, 21], [22, 23], [24, 25, 26]], 0
+                ),
+                request,
+                generate_config,
+            ),
+            debug_info=None,
+        )
+
+        choice = complete.choices[0]
+        self.assertEqual(choice.message.content, "think-prefix</think>AB")
+        self.assertIsNone(choice.message.reasoning_content)
+        self.assertEqual(
+            "".join(record.token for record in choice.logprobs.content),
+            choice.message.content,
+        )
+        self.assertEqual(
+            complete.usage.completion_tokens_details.reasoning_tokens,
+            0,
+        )
+
+    async def test_reasoning_async_still_splits_without_logprobs(self):
+        renderer = create_compact_logprob_renderer()
+        renderer.think_mode = True
+        renderer.think_end_tag = "</think>"
+        request = ChatCompletionRequest(messages=[], stream=True, logprobs=False)
+        generate_config = GenerateConfig(is_streaming=True, max_new_tokens=32)
+        complete = await OpenaiEndpoint._collect_complete_response(
+            renderer.render_response_stream(
+                compact_reasoning_output_generator([[20, 21], [22, 23], [24, 25, 26]]),
+                request,
+                generate_config,
+            ),
+            debug_info=None,
+        )
+
+        choice = complete.choices[0]
+        self.assertEqual(choice.message.reasoning_content, "think-prefix")
+        self.assertEqual(choice.message.content, "AB")
+        self.assertIsNone(choice.logprobs)
+        self.assertGreater(
+            complete.usage.completion_tokens_details.reasoning_tokens,
+            0,
+        )
+
+    def test_reasoning_logprobs_streaming_keeps_raw_content_aligned(self):
+        chunks = [[20, 21], [22, 23], [24, 25, 26]]
+        expected_tokens = [
+            "think",
+            "-",
+            "prefix",
+            "</",
+            "think>",
+            "A",
+            "B",
+        ]
+        expected_content = "think-prefix</think>AB"
+
+        for top_k in (0, 2):
+            with self.subTest(top_k=top_k):
+                renderer = create_compact_reasoning_logprob_renderer()
+                request = ChatCompletionRequest(
+                    messages=[], stream=True, logprobs=True, top_logprobs=top_k
+                )
+                status_list = renderer._create_status_list_sync(
+                    1, request.model_dump_json(exclude_none=True)
+                )
+                content_parts = []
+                logprob_records = []
+                output_len = 0
+                final_payload = None
+
+                for token_ids in chunks:
+                    output_len += len(token_ids)
+                    final_payload = make_sync_logprob_payload(token_ids, top_k)
+                    (
+                        token_logprobs_list,
+                        top_token_ids_list,
+                        top_logprobs_list,
+                        output_ids_list,
+                    ) = final_payload
+                    response = json.loads(
+                        renderer.render_stream_response_refactor(
+                            status_list,
+                            [3],
+                            [output_len],
+                            [0],
+                            token_logprobs_list,
+                            top_token_ids_list,
+                            top_logprobs_list,
+                            output_ids_list,
+                            32,
+                            [],
+                            True,
+                        )
+                    )
+                    choice = response["choices"][0]
+                    content_parts.append(choice["delta"]["content"])
+                    self.assertNotIn("reasoning_content", choice["delta"])
+                    logprob_records.extend(choice["logprobs"]["content"])
+
+                self.assertIsNotNone(final_payload)
+                flush_choice = json.loads(
+                    renderer.render_stream_response_flush(
+                        status_list,
+                        [3],
+                        [output_len],
+                        [0],
+                        *final_payload,
+                        [],
+                        True,
+                    )
+                )["choices"][0]
+                self.assertEqual(flush_choice["delta"]["content"], "")
+                self.assertNotIn("logprobs", flush_choice)
+                final_choice = json.loads(
+                    renderer.render_stream_response_final(
+                        status_list, [3], [output_len], [0]
+                    )
+                )["choices"][0]
+                self.assertEqual(final_choice["finish_reason"], "stop")
+
+                self.assertEqual("".join(content_parts), expected_content)
+                self.assertEqual(
+                    [record["token"] for record in logprob_records], expected_tokens
+                )
+                self.assertEqual(
+                    "".join(record["token"] for record in logprob_records),
+                    expected_content,
+                )
+                self.assertTrue(
+                    all(
+                        len(record["top_logprobs"]) == top_k
+                        for record in logprob_records
+                    )
+                )
+
+    def test_reasoning_logprobs_blocking_collect_keeps_raw_content_aligned(self):
+        chunks = [[20, 21, 22, 23, 24], [25], [26]]
+        expected_tokens = [
+            "think",
+            "-",
+            "prefix",
+            "</",
+            "think>",
+            "A",
+            "B",
+        ]
+        expected_content = "think-prefix</think>AB"
+
+        for top_k in (0, 2):
+            with self.subTest(top_k=top_k):
+                renderer = create_compact_reasoning_logprob_renderer()
+                request = ChatCompletionRequest(
+                    messages=[], stream=False, logprobs=True, top_logprobs=top_k
+                )
+                status_list = renderer._create_status_list_sync(
+                    1, request.model_dump_json(exclude_none=True)
+                )
+                responses = [renderer.render_stream_response_first_blocking(1)]
+                output_len = 0
+                final_payload = None
+
+                for token_ids in chunks:
+                    output_len += len(token_ids)
+                    final_payload = make_sync_logprob_payload(token_ids, top_k)
+                    responses.append(
+                        renderer.render_stream_response_blocking(
+                            status_list,
+                            [3],
+                            [output_len],
+                            [0],
+                            *final_payload,
+                            32,
+                            [],
+                            False,
+                        )
+                    )
+
+                if top_k == 0:
+                    # Model a delayed probability ledger: the first text response
+                    # already contains </think>, while its records arrive next.
+                    delayed_logprobs = responses[1].choices[0].logprobs
+                    responses[1].choices[0].logprobs = None
+                    responses[2].choices[0].logprobs.content = (
+                        delayed_logprobs.content
+                        + responses[2].choices[0].logprobs.content
+                    )
+
+                self.assertIsNotNone(final_payload)
+                responses.append(
+                    renderer.render_stream_response_flush_blocking(
+                        status_list,
+                        [3],
+                        [output_len],
+                        [0],
+                        *final_payload,
+                        [],
+                        False,
+                    )
+                )
+                responses.append(
+                    renderer.render_stream_response_final_blocking(
+                        status_list, [3], [output_len], [0]
+                    )
+                )
+                complete_response = json.loads(
+                    renderer.collect_complete_response(responses)
+                )
+                choice = complete_response["choices"][0]
+                self.assertEqual(choice["message"]["content"], expected_content)
+                self.assertNotIn("reasoning_content", choice["message"])
+                logprob_records = choice["logprobs"]["content"]
+                self.assertEqual(
+                    [record["token"] for record in logprob_records], expected_tokens
+                )
+                self.assertEqual(
+                    "".join(record["token"] for record in logprob_records),
+                    expected_content,
+                )
+                self.assertTrue(
+                    all(
+                        len(record["top_logprobs"]) == top_k
+                        for record in logprob_records
+                    )
+                )
+                if top_k > 0:
+                    self.assertEqual(
+                        [item["token"] for item in logprob_records[-1]["top_logprobs"]],
+                        ["B", "X"],
+                    )
+                    self.assertAlmostEqual(
+                        logprob_records[-1]["top_logprobs"][1]["logprob"],
+                        -9.0,
+                    )
+
+    def test_reasoning_blocking_collect_still_splits_without_logprobs(self):
+        renderer = create_compact_reasoning_logprob_renderer()
+        request = ChatCompletionRequest(messages=[], stream=False, logprobs=False)
+        status_list = renderer._create_status_list_sync(
+            1, request.model_dump_json(exclude_none=True)
+        )
+        responses = [renderer.render_stream_response_first_blocking(1)]
+        chunks = [[20, 21, 22, 23], [24, 25, 26]]
+        output_len = 0
+        for token_ids in chunks:
+            output_len += len(token_ids)
+            responses.append(
+                renderer.render_stream_response_blocking(
+                    status_list,
+                    [3],
+                    [output_len],
+                    [0],
+                    [torch.tensor([token_ids], dtype=torch.int32)],
+                    32,
+                    [],
+                    False,
+                )
+            )
+        responses.append(
+            renderer.render_stream_response_flush_blocking(
+                status_list,
+                [3],
+                [output_len],
+                [0],
+                [torch.tensor([chunks[-1]], dtype=torch.int32)],
+                [],
+                False,
+            )
+        )
+        responses.append(
+            renderer.render_stream_response_final_blocking(
+                status_list, [3], [output_len], [0]
+            )
+        )
+
+        choice = json.loads(renderer.collect_complete_response(responses))["choices"][0]
+        self.assertEqual(choice["message"]["reasoning_content"], "think-prefix")
+        self.assertEqual(choice["message"]["content"], "AB")
+        self.assertNotIn("logprobs", choice)
+
+    def test_qwen_sync_flush_accepts_compact_public_abi(self):
+        renderer = create_compact_qwen_renderer()
+        request = ChatCompletionRequest(messages=[], logprobs=False)
+        output_ids_list = [torch.tensor([[1]], dtype=torch.int32)]
+
+        streaming_status = QwenStreamStatusSync(request)
+        streaming_status.total_output_string = "A"
+        streaming_json = renderer.render_stream_response_flush(
+            [streaming_status], [3], [1], [0], [], True
+        )
+        self.assertEqual(
+            json.loads(streaming_json)["choices"][0]["delta"]["content"], "A"
+        )
+
+        blocking_status = QwenStreamStatusSync(request)
+        blocking_status.total_output_string = "A"
+        blocking_response = renderer.render_stream_response_flush_blocking(
+            [blocking_status], [3], [1], [0], [], False
+        )
+        self.assertEqual(blocking_response.choices[0].delta.content, "A")
+
+    def test_sync_response_rejects_malformed_lists_before_status_update(self):
+        renderer = create_compact_logprob_renderer()
+        output_ids_list = [torch.tensor([[1]], dtype=torch.int32)]
+
+        compact_status = custom_renderer.StreamStatusSync(
+            ChatCompletionRequest(messages=[], logprobs=False)
+        )
+        with self.assertRaisesRegex(ValueError, "core lists must match"):
+            renderer.render_stream_response_blocking(
+                [compact_status],
+                [],
+                [1],
+                [0],
+                output_ids_list,
+                16,
+                [],
+                False,
+            )
+        self.assertEqual(compact_status.index, 0)
+
+        extended_status = custom_renderer.StreamStatusSync(
+            ChatCompletionRequest(messages=[], logprobs=True, top_logprobs=0)
+        )
+        with self.assertRaisesRegex(ValueError, "logprob lists must match"):
+            renderer.render_stream_response_blocking(
+                [extended_status],
+                [3],
+                [1],
+                [0],
+                [torch.tensor([[-0.1]], dtype=torch.float32)],
+                [],
+                [torch.empty((1, 1, 0), dtype=torch.float32)],
+                output_ids_list,
+                16,
+                [],
+                False,
+            )
+        self.assertEqual(extended_status.index, 0)
 
     def test_compact_logprobs_sync_non_streaming_buffers_utf8(self):
         renderer = create_compact_logprob_renderer()

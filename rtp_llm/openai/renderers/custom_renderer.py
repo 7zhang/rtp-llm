@@ -383,6 +383,7 @@ class ThinkStatus:
     think_buffer: str = ""
     think_tokens: int = 0
     is_streaming: bool = False
+    raw_content_for_logprobs: bool = False
 
 
 class RenderedInputs:
@@ -1436,7 +1437,20 @@ class CustomChatRenderer:
         reuse_lengths = items[0].reuse_length
         all_choices = []
         for i, item in enumerate(items):
-            delta = self._split_reasoning_text_and_content(item, think_status_list[i])
+            # OpenAI exposes token logprobs only for ``content``. Keep the raw
+            # model text in that field when probabilities are requested so the
+            # token strings and ``delta.content`` stay one-to-one. The C++ sync
+            # renderer already follows this contract; without this guard the
+            # Python async path moved thinking text to ``reasoning_content`` but
+            # still attached all of its probabilities to ``logprobs.content``.
+            if think_status_list[i].raw_content_for_logprobs and isinstance(
+                item.output_str, str
+            ):
+                delta = DeltaMessage(content=item.output_str)
+            else:
+                delta = self._split_reasoning_text_and_content(
+                    item, think_status_list[i]
+                )
             all_choices.append(
                 ChatCompletionResponseStreamChoice(
                     index=i,
@@ -1605,13 +1619,22 @@ class CustomChatRenderer:
         nums_output = last_num_beams if last_num_beams != 1 else nums_output
         status_list = await self._create_status_list(nums_output, request)
         index = 0
+        raw_content_for_logprobs = bool(generate_config.return_logprobs)
         think_status_list = [
             ThinkStatus(
                 enable_think_mode=bool(self.in_think_mode(request)),
-                in_think_mode=bool(self.should_process_think(request)),
+                # Raw logprob mode exposes thinking text as ordinary content so
+                # its tokens remain one-to-one with ``logprobs.content``. Do not
+                # simultaneously classify those same tokens as hidden reasoning.
+                in_think_mode=(
+                    False
+                    if raw_content_for_logprobs
+                    else bool(self.should_process_think(request))
+                ),
                 think_buffer="",
                 think_tokens=0,
                 is_streaming=generate_config.is_streaming,
+                raw_content_for_logprobs=raw_content_for_logprobs,
             )
             for _ in range(nums_output)
         ]
@@ -1699,9 +1722,9 @@ class CustomChatRenderer:
         input_len: int,  # output.aux_info
         output_len: int,  # output.aux_info
         reuse_len: int,  # output.aux_info
-        token_logprobs: torch.Tensor,
-        top_logprob_token_ids: torch.Tensor,
-        top_logprobs: torch.Tensor,
+        token_logprobs: Optional[torch.Tensor],
+        top_logprob_token_ids: Optional[torch.Tensor],
+        top_logprobs: Optional[torch.Tensor],
         output_ids: torch.Tensor,
         max_new_tokens: int,
         stop_words_str: List[str],
@@ -1921,43 +1944,111 @@ class CustomChatRenderer:
         )
         return chat_response.model_dump_json(exclude_none=True)
 
-    def render_stream_response_refactor(
+    @staticmethod
+    def _parse_sync_response_args(render_args):
+        """Accept both the compact non-logprob and extended logprob ABI."""
+        if len(render_args) == 4:
+            output_ids_list, max_new_tokens, stop_words_str, is_streaming = render_args
+            return (
+                None,
+                None,
+                None,
+                output_ids_list,
+                max_new_tokens,
+                stop_words_str,
+                is_streaming,
+            )
+        if len(render_args) == 7:
+            return render_args
+        raise TypeError(
+            "sync response expects compact output_ids/config arguments or "
+            "the three logprob tensor lists followed by output_ids/config"
+        )
+
+    @staticmethod
+    def _parse_sync_flush_args(render_args):
+        """Accept the minimal, compact, and legacy extended flush ABIs."""
+        if len(render_args) == 2:
+            stop_words_str, is_streaming = render_args
+            return None, None, None, None, stop_words_str, is_streaming
+        if len(render_args) == 3:
+            output_ids_list, stop_words_str, is_streaming = render_args
+            return None, None, None, output_ids_list, stop_words_str, is_streaming
+        if len(render_args) == 6:
+            return render_args
+        raise TypeError(
+            "sync flush expects stop/config arguments, compact output_ids/config "
+            "arguments, or the three logprob tensor lists followed by "
+            "output_ids/config"
+        )
+
+    def _render_sync_delta_list(
         self,
-        status_list: StreamStatusSync,  # pass in from cpp
-        input_len_list,  # output.aux_info
-        output_len_list,  # output.aux_info
-        reuse_len_list,  # output.aux_info
-        token_logprobs_list,  # GenerateOutput
-        top_logprob_token_ids_list,  # GenerateOutput
-        top_logprobs_list,  # GenerateOutput
-        output_ids_list,  # GenerateOutput
-        max_new_tokens,  # GenerateConfig
-        stop_words_str,  # GenerateConfig
+        status_list,
+        input_len_list,
+        output_len_list,
+        reuse_len_list,
+        token_logprobs_list,
+        top_logprob_token_ids_list,
+        top_logprobs_list,
+        output_ids_list,
+        max_new_tokens,
+        stop_words_str,
         is_streaming,
-    ):
-        stop_word_slice_list = get_stop_word_slices(
-            stop_words_str
-        )  # move into cpp, then pass in
-        delta_list: List[OutputDelta] = []
-        for (
-            status,
-            input_len,
-            output_len,
-            reuse_len,
-            token_logprobs,
-            top_logprob_token_ids,
-            top_logprobs,
-            output_ids,
-        ) in zip(
-            status_list,
-            input_len_list,
-            output_len_list,
-            reuse_len_list,  # AuxInfo
-            token_logprobs_list,
-            top_logprob_token_ids_list,
-            top_logprobs_list,
-            output_ids_list,  # GenerateOutput
+    ) -> List[OutputDelta]:
+        expected_count = len(status_list)
+        if not (
+            len(input_len_list)
+            == len(output_len_list)
+            == len(reuse_len_list)
+            == len(output_ids_list)
+            == expected_count
         ):
+            raise ValueError(
+                "sync response core lists must match status_list length "
+                f"{expected_count}"
+            )
+
+        has_token_logprobs = token_logprobs_list is not None
+        has_top_token_ids = top_logprob_token_ids_list is not None
+        has_top_logprobs = top_logprobs_list is not None
+        if not (has_token_logprobs == has_top_token_ids == has_top_logprobs):
+            raise ValueError(
+                "sync response logprob lists must be supplied together or omitted"
+            )
+        if has_token_logprobs and not (
+            len(token_logprobs_list)
+            == len(top_logprob_token_ids_list)
+            == len(top_logprobs_list)
+            == expected_count
+        ):
+            raise ValueError(
+                "sync response logprob lists must match status_list length "
+                f"{expected_count}"
+            )
+
+        stop_word_slice_list = get_stop_word_slices(stop_words_str)
+        delta_list: List[OutputDelta] = []
+        for index, (status, input_len, output_len, reuse_len, output_ids) in enumerate(
+            zip(
+                status_list,
+                input_len_list,
+                output_len_list,
+                reuse_len_list,
+                output_ids_list,
+            )
+        ):
+            token_logprobs = (
+                None if token_logprobs_list is None else token_logprobs_list[index]
+            )
+            top_logprob_token_ids = (
+                None
+                if top_logprob_token_ids_list is None
+                else top_logprob_token_ids_list[index]
+            )
+            top_logprobs = (
+                None if top_logprobs_list is None else top_logprobs_list[index]
+            )
             delta_list.append(
                 self._update_single_status_sync(
                     status,
@@ -1974,6 +2065,38 @@ class CustomChatRenderer:
                     is_streaming,
                 )
             )
+        return delta_list
+
+    def render_stream_response_refactor(
+        self,
+        status_list: StreamStatusSync,  # pass in from cpp
+        input_len_list,  # output.aux_info
+        output_len_list,  # output.aux_info
+        reuse_len_list,  # output.aux_info
+        *render_args,
+    ):
+        (
+            token_logprobs_list,
+            top_logprob_token_ids_list,
+            top_logprobs_list,
+            output_ids_list,
+            max_new_tokens,
+            stop_words_str,
+            is_streaming,
+        ) = self._parse_sync_response_args(render_args)
+        delta_list = self._render_sync_delta_list(
+            status_list,
+            input_len_list,
+            output_len_list,
+            reuse_len_list,
+            token_logprobs_list,
+            top_logprob_token_ids_list,
+            top_logprobs_list,
+            output_ids_list,
+            max_new_tokens,
+            stop_words_str,
+            is_streaming,
+        )
         stream_response = self._generate_stream_response_sync(delta_list)
         chat_response = ChatCompletionStreamResponse(
             choices=stream_response.choices,
@@ -1988,22 +2111,25 @@ class CustomChatRenderer:
         input_len_list,
         output_len_list,
         reuse_len_list,
-        token_logprobs_list,
-        top_logprob_token_ids_list,
-        top_logprobs_list,
-        output_ids_list,
-        stop_words_str,
-        is_streaming,
+        *render_args,
     ):
+        (
+            _token_logprobs_list,
+            _top_logprob_token_ids_list,
+            _top_logprobs_list,
+            _output_ids_list,
+            stop_words_str,
+            is_streaming,
+        ) = self._parse_sync_flush_args(render_args)
         stream_response = self._flush_buffer_sync(
             status_list,
             input_len_list,
             output_len_list,
             reuse_len_list,
-            token_logprobs_list,
-            top_logprob_token_ids_list,
-            top_logprobs_list,
-            output_ids_list,
+            _token_logprobs_list,
+            _top_logprob_token_ids_list,
+            _top_logprobs_list,
+            _output_ids_list,
             stop_words_str,
             is_streaming,
         )
@@ -2037,53 +2163,30 @@ class CustomChatRenderer:
         input_len_list,  # output.aux_info
         output_len_list,  # output.aux_info
         reuse_len_list,  # output.aux_info
-        token_logprobs_list,  # GenerateOutput
-        top_logprob_token_ids_list,  # GenerateOutput
-        top_logprobs_list,  # GenerateOutput
-        output_ids_list,  # GenerateOutput
-        max_new_tokens,  # GenerateConfig
-        stop_words_str,  # GenerateConfig
-        is_streaming,
+        *render_args,
     ):
-        stop_word_slice_list = get_stop_word_slices(
-            stop_words_str
-        )  # move into cpp, then pass in
-        delta_list: List[OutputDelta] = []
-        for (
-            status,
-            input_len,
-            output_len,
-            reuse_len,
-            token_logprobs,
-            top_logprob_token_ids,
-            top_logprobs,
-            output_ids,
-        ) in zip(
-            status_list,
-            input_len_list,
-            output_len_list,
-            reuse_len_list,  # AuxInfo
+        (
             token_logprobs_list,
             top_logprob_token_ids_list,
             top_logprobs_list,
-            output_ids_list,  # GenerateOutput
-        ):
-            delta_list.append(
-                self._update_single_status_sync(
-                    status,
-                    input_len,
-                    output_len,
-                    reuse_len,
-                    token_logprobs,
-                    top_logprob_token_ids,
-                    top_logprobs,
-                    output_ids,
-                    max_new_tokens,
-                    stop_words_str,
-                    stop_word_slice_list,
-                    is_streaming,
-                )
-            )
+            output_ids_list,
+            max_new_tokens,
+            stop_words_str,
+            is_streaming,
+        ) = self._parse_sync_response_args(render_args)
+        delta_list = self._render_sync_delta_list(
+            status_list,
+            input_len_list,
+            output_len_list,
+            reuse_len_list,
+            token_logprobs_list,
+            top_logprob_token_ids_list,
+            top_logprobs_list,
+            output_ids_list,
+            max_new_tokens,
+            stop_words_str,
+            is_streaming,
+        )
         stream_response = self._generate_stream_response_sync(delta_list)
         return stream_response
 
@@ -2093,22 +2196,25 @@ class CustomChatRenderer:
         input_len_list,
         output_len_list,
         reuse_len_list,
-        token_logprobs_list,
-        top_logprob_token_ids_list,
-        top_logprobs_list,
-        output_ids_list,
-        stop_words_str,
-        is_streaming,
+        *render_args,
     ):
+        (
+            _token_logprobs_list,
+            _top_logprob_token_ids_list,
+            _top_logprobs_list,
+            _output_ids_list,
+            stop_words_str,
+            is_streaming,
+        ) = self._parse_sync_flush_args(render_args)
         stream_response = self._flush_buffer_sync(
             status_list,
             input_len_list,
             output_len_list,
             reuse_len_list,
-            token_logprobs_list,
-            top_logprob_token_ids_list,
-            top_logprobs_list,
-            output_ids_list,
+            _token_logprobs_list,
+            _top_logprob_token_ids_list,
+            _top_logprobs_list,
+            _output_ids_list,
             stop_words_str,
             is_streaming,
         )
@@ -2140,16 +2246,12 @@ class CustomChatRenderer:
             if len(response.choices) != len(all_choices):
                 if all_choices == []:
                     for i, choice in enumerate(response.choices):
-                        content, reasoning_content = split_think_tag(
-                            choice.delta.content
-                        )
                         all_choices.append(
                             ChatCompletionResponseChoice(
                                 index=i,
                                 message=ChatMessage(
                                     role=choice.delta.role or RoleEnum.assistant,
-                                    content=content or None,
-                                    reasoning_content=reasoning_content or None,
+                                    content=choice.delta.content or None,
                                     function_call=choice.delta.function_call or None,
                                 ),
                                 finish_reason=choice.finish_reason,
@@ -2171,11 +2273,6 @@ class CustomChatRenderer:
                         all_choices[i].message.content += (
                             response.choices[i].delta.content or ""
                         )
-                    content, reasoning_content = split_think_tag(
-                        all_choices[i].message.content
-                    )
-                    all_choices[i].message.content = content
-                    all_choices[i].message.reasoning_content = reasoning_content
                     all_choices[i].message.role = (
                         response.choices[i].delta.role or all_choices[i].message.role
                     )
@@ -2196,6 +2293,14 @@ class CustomChatRenderer:
                         all_choices[i].logprobs = response.choices[i].logprobs
             usage = response.usage or usage
             aux_info = response.aux_info or aux_info
+
+        for choice in all_choices:
+            if choice.logprobs is None:
+                content, reasoning_content = split_think_tag(choice.message.content)
+                choice.message.content = content
+                choice.message.reasoning_content = reasoning_content
+            # Logprob mode intentionally leaves raw thinking content untouched
+            # so every visible token stays aligned with one probability record.
 
         if usage == None:
             logging.warning(f"No usage returned from stream response. use empty value.")

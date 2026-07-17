@@ -137,6 +137,39 @@ def _parse_optional_parameter_int(request, param_name: str) -> int | None:
     return None
 
 
+def _parse_num_return_sequences_parameter_fallback(
+    request, ds_attrs: dict[str, Any]
+) -> int | None:
+    """Read the non-tensor ``num_return_sequences`` / ``n`` fallback.
+
+    Input tensors are the established Dash wire contract and retain their
+    existing precedence.  Direct Triton parameters were added as a compatibility
+    fallback for OpenAI-style logprob requests, so reject conflicting aliases
+    instead of silently choosing one.  Nested ``ds_header_attributes`` keeps the
+    same alias priority as before.
+    """
+    parameter_values = {
+        name: _parse_optional_parameter_int(request, name)
+        for name in ("num_return_sequences", "n")
+        if name in request.parameters
+    }
+    parsed_parameter_values = {
+        name: value for name, value in parameter_values.items() if value is not None
+    }
+    if len(set(parsed_parameter_values.values())) > 1:
+        raise DashScParameterError("conflicting n and num_return_sequences parameters")
+    for name in ("num_return_sequences", "n"):
+        if name in parsed_parameter_values:
+            return parsed_parameter_values[name]
+
+    value = _parse_optional_int_value(
+        _lookup_ds_request_control(ds_attrs, "num_return_sequences")
+    )
+    if value is None:
+        value = _parse_optional_int_value(_lookup_ds_request_control(ds_attrs, "n"))
+    return value
+
+
 def _parse_optional_parameter_bool(request, param_name: str) -> bool | None:
     if param_name not in request.parameters:
         return None
@@ -810,21 +843,26 @@ def parse_sampling_params(
         max_total_tokens,
     ) = _parse_max_token_limits(request, ds_attrs)
 
-    v = _parse_optional_scalar_int(request, "num_return_sequences")
-    if v is None:
-        v = _parse_optional_scalar_int(request, "n")
-    if v is None:
-        v = _parse_optional_parameter_int(request, "num_return_sequences")
-    if v is None:
-        v = _parse_optional_parameter_int(request, "n")
-    if v is None:
-        v = _parse_optional_int_value(
-            _lookup_ds_request_control(ds_attrs, "num_return_sequences")
+    tensor_num_return_sequences = _parse_optional_scalar_int(
+        request, "num_return_sequences"
+    )
+    if tensor_num_return_sequences is None:
+        tensor_num_return_sequences = _parse_optional_scalar_int(request, "n")
+    parameter_num_return_sequences: int | None = None
+    if tensor_num_return_sequences is not None:
+        # Tensor controls are the pre-existing contract and continue to map to
+        # GenerateConfig regardless of the logprobs switch.
+        num_return_sequences = max(0, tensor_num_return_sequences)
+    else:
+        parameter_num_return_sequences = _parse_num_return_sequences_parameter_fallback(
+            request, ds_attrs
         )
-    if v is None:
-        v = _parse_optional_int_value(_lookup_ds_request_control(ds_attrs, "n"))
-    if v is not None:
-        num_return_sequences = max(0, v)
+        if parameter_num_return_sequences is not None:
+            parameter_num_return_sequences = max(0, parameter_num_return_sequences)
+            # Dash encodes only generate_outputs[0].  Never let a parameter
+            # fallback silently create backend results that cannot be returned.
+            if parameter_num_return_sequences > 1:
+                raise DashScParameterError("DashScope response does not support n > 1")
 
     vf = _parse_optional_scalar_float(request, "top_p")
     if vf is not None:
@@ -879,6 +917,11 @@ def parse_sampling_params(
             raise DashScParameterError("top_logprobs must be between 0 and 20")
         if not return_logprobs:
             raise DashScParameterError("top_logprobs requires logprobs=true")
+    if parameter_num_return_sequences is not None and return_logprobs:
+        # Before logprob support, request.parameters did not control backend
+        # fan-out.  Preserve that behavior for ordinary requests while allowing
+        # OpenAI-style logprob requests to carry their explicit single-result n.
+        num_return_sequences = parameter_num_return_sequences
     if return_logprobs and num_return_sequences > 1:
         raise DashScParameterError("logprobs does not support n > 1")
 

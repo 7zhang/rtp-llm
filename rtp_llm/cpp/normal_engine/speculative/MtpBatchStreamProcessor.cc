@@ -49,6 +49,10 @@ torch::Tensor clonePrefillLastHiddenSlice(const torch::Tensor& hidden_states,
 
 }  // namespace
 
+bool shouldFinalizeMtpTargetLogprobsEarly(bool stream_async_enabled, const MtpTargetLogprobs& target_logprobs) {
+    return stream_async_enabled && target_logprobs.retainsFullLmHeadStorage();
+}
+
 namespace {
 
 // Fallback-hit counters. Each counter is incremented when a hot-path
@@ -1124,28 +1128,45 @@ void MtpBatchStreamProcessor::preparePrefillSpecUpdateInfo(const StreamGroups&  
     }
 }
 
+void MtpBatchStreamProcessor::finalizeDecodeTargetLogprobs(
+    const StreamGroups&                          stream_groups,
+    const speculative::SpeculativeSamplerOutput& spec_decode_output,
+    MtpTargetLogprobs&                           target_logprobs) const {
+    if (!target_logprobs.defined() || target_logprobs.finalized()) {
+        return;
+    }
+
+    RTP_LLM_CHECK(target_logprobs.raw_logits.defined());
+    spec_decode_output.transfer_done_event->synchronize();
+    auto        selected_rows     = collectAcceptedMtpLogprobRows(stream_groups,
+                                                       spec_decode_output.accept_len_cpu,
+                                                       static_cast<int64_t>(propose_step_ + 1),
+                                                       target_logprobs.dense_row_count);
+    const auto& emitted_token_ids = target_logprobs.raw_logits.is_cuda() && spec_decode_output.accept_tokens.defined()
+                                            && spec_decode_output.accept_tokens.is_cuda() ?
+                                        spec_decode_output.accept_tokens :
+                                        spec_decode_output.accept_tokens_cpu;
+    finalizeSelectedMtpTargetLogprobs(target_logprobs, emitted_token_ids, selected_rows);
+}
+
 void MtpBatchStreamProcessor::prepareDecodeSpecUpdateInfo(
     const StreamGroups&                          stream_groups,
     const speculative::SpeculativeSamplerOutput& spec_decode_output,
     const MergedOutput&                          draft_prefill_output,
     MtpTargetLogprobs&                           target_logprobs,
     std::vector<StreamSpecUpdateInfo>&           spec_update_infos) const {
-    // wait for the transfer to complete
-    spec_decode_output.transfer_done_event->synchronize();
+    if (target_logprobs.defined() && !target_logprobs.finalized()) {
+        finalizeDecodeTargetLogprobs(stream_groups, spec_decode_output, target_logprobs);
+    } else {
+        // The regular bookkeeping path still consumes the CPU accept tensors.
+        // An early-finalized payload has already waited this event; repeating
+        // the completed event synchronization is cheap and keeps this method's
+        // standalone contract unchanged.
+        spec_decode_output.transfer_done_event->synchronize();
+    }
+
     const auto& accept_len    = spec_decode_output.accept_len_cpu;
     const auto& accept_tokens = spec_decode_output.accept_tokens_cpu;
-
-    if (target_logprobs.defined() && !target_logprobs.finalized()) {
-        RTP_LLM_CHECK(target_logprobs.raw_logits.defined());
-        auto selected_rows = collectAcceptedMtpLogprobRows(
-            stream_groups, accept_len, static_cast<int64_t>(propose_step_ + 1), target_logprobs.dense_row_count);
-        const auto& emitted_token_ids = target_logprobs.raw_logits.is_cuda()
-                                                && spec_decode_output.accept_tokens.defined()
-                                                && spec_decode_output.accept_tokens.is_cuda() ?
-                                            spec_decode_output.accept_tokens :
-                                            spec_decode_output.accept_tokens_cpu;
-        finalizeSelectedMtpTargetLogprobs(target_logprobs, emitted_token_ids, selected_rows);
-    }
 
     const auto& draft_model_output   = draft_prefill_output.model_output;
     const auto& draft_sampler_output = draft_prefill_output.sampler_output;

@@ -571,7 +571,43 @@ TEST_F(MtpExecutorTest, testFinalizeSelectedMtpTargetLogprobsReducesOnlyAccepted
     EXPECT_TRUE(torch::allclose(result.top_logprobs, std::get<0>(expected_topk)));
 }
 
-TEST_F(MtpExecutorTest, testMixedMtpLogprobCaptureMapsDifferentAcceptanceLengthsOnCpu) {
+TEST_F(MtpExecutorTest, testDenseMixedMtpDecodeLogprobCaptureRemainsZeroCopy) {
+    // Model a P=5 batch where 127/128 streams request logprobs and each emits
+    // one row. Decode capture must not materialize the almost-full [762,V]
+    // requested-row copy before acceptance is known.
+    constexpr int64_t batch_size          = 128;
+    constexpr int64_t positions_per_batch = 6;
+    constexpr int64_t padded_vocab_size   = 7;
+    constexpr int64_t real_vocab_size     = 5;
+    const int64_t     dense_rows          = batch_size * positions_per_batch;
+    auto              logits = torch::arange(0, padded_vocab_size, torch::kFloat32).repeat({dense_rows, 1});
+
+    auto result = captureMtpDecodeTargetLogprobs(logits, /*max_top_logprobs=*/2, /*real_vocab_size=*/real_vocab_size);
+
+    ASSERT_EQ(result.raw_logits.sizes(), (torch::IntArrayRef{dense_rows, real_vocab_size}));
+    EXPECT_EQ(result.raw_logits.data_ptr<float>(), logits.data_ptr<float>());
+    EXPECT_TRUE(result.captured_dense_row_indices.empty());
+    EXPECT_FALSE(result.source_row_indices.defined());
+    EXPECT_TRUE(result.retainsFullLmHeadStorage());
+    EXPECT_TRUE(shouldFinalizeMtpTargetLogprobsEarly(/*stream_async_enabled=*/true, result));
+    EXPECT_FALSE(result.row_logsumexp.defined());
+    EXPECT_FALSE(result.top_logits.defined());
+
+    std::vector<int64_t> accepted_requested_rows;
+    accepted_requested_rows.reserve(batch_size - 1);
+    for (int64_t stream_idx = 0; stream_idx < batch_size - 1; ++stream_idx) {
+        accepted_requested_rows.push_back(stream_idx * positions_per_batch);
+    }
+    auto emitted_ids = torch::zeros({batch_size, positions_per_batch}, torch::kInt32);
+    finalizeSelectedMtpTargetLogprobs(result, emitted_ids, accepted_requested_rows);
+
+    ASSERT_TRUE(result.finalized());
+    EXPECT_FALSE(result.retainsFullLmHeadStorage());
+    EXPECT_EQ(result.token_logprobs.size(0), batch_size - 1);
+    EXPECT_EQ(result.top_logprobs.sizes(), (torch::IntArrayRef{batch_size - 1, 2}));
+}
+
+TEST_F(MtpExecutorTest, testSparseMtpLogprobCaptureMapsDifferentAcceptanceLengthsOnCpu) {
     // P=2: dense rows [0,3) and [6,9) request logprobs, while the middle
     // stream is plain. The two requesting streams later emit 2 and 1 tokens.
     auto                       logits              = torch::arange(0, 63, torch::kFloat32).reshape({9, 7});
@@ -579,15 +615,15 @@ TEST_F(MtpExecutorTest, testMixedMtpLogprobCaptureMapsDifferentAcceptanceLengths
     const std::vector<int64_t> captured_dense_rows = {0, 1, 2, 6, 7, 8};
     const std::vector<int64_t> selected_dense_rows = {0, 1, 6};
 
-    // Every row requested: keep the zero-copy vocabulary view and require the
-    // async release sync because that view still owns the full LM-head storage.
+    // The generic helper keeps an explicit full identity zero-copy, while its
+    // sparse mode remains available to prefill and focused utility tests.
     auto identity_capture = captureMtpTargetLogprobs(logits,
                                                      /*max_top_logprobs=*/2,
                                                      /*real_vocab_size=*/5,
                                                      /*captured_dense_row_indices=*/{0, 1, 2, 3, 4, 5, 6, 7, 8});
     EXPECT_EQ(identity_capture.raw_logits.data_ptr<float>(), logits.data_ptr<float>());
     EXPECT_TRUE(identity_capture.captured_dense_row_indices.empty());
-    EXPECT_TRUE(identity_capture.requiresAsyncLmHeadReleaseSync());
+    EXPECT_TRUE(identity_capture.retainsFullLmHeadStorage());
 
     auto result = captureMtpTargetLogprobs(logits, /*max_top_logprobs=*/2, /*real_vocab_size=*/5, captured_dense_rows);
 
@@ -595,7 +631,7 @@ TEST_F(MtpExecutorTest, testMixedMtpLogprobCaptureMapsDifferentAcceptanceLengths
     EXPECT_EQ(result.dense_row_count, 9);
     EXPECT_EQ(result.captured_dense_row_indices, captured_dense_rows);
     EXPECT_NE(result.raw_logits.data_ptr<float>(), logits.data_ptr<float>());
-    EXPECT_FALSE(result.requiresAsyncLmHeadReleaseSync());
+    EXPECT_FALSE(result.retainsFullLmHeadStorage());
     EXPECT_FALSE(result.row_logsumexp.defined());
     EXPECT_FALSE(result.top_logits.defined());
     EXPECT_FALSE(result.top_logprob_token_ids.defined());
@@ -613,7 +649,7 @@ TEST_F(MtpExecutorTest, testMixedMtpLogprobCaptureMapsDifferentAcceptanceLengths
     EXPECT_TRUE(torch::allclose(result.top_logprobs, std::get<0>(expected_topk)));
 }
 
-TEST_F(MtpExecutorTest, testMixedMtpLogprobCaptureMapsDifferentAcceptanceLengthsOnCuda) {
+TEST_F(MtpExecutorTest, testSparseMtpLogprobCaptureMapsDifferentAcceptanceLengthsOnCuda) {
     // Same mixed P=2 layout as the CPU case, with acceptance lengths 1 and 3.
     // Padded vocabulary columns must neither be retained nor reduced.
     auto logits =
@@ -625,13 +661,13 @@ TEST_F(MtpExecutorTest, testMixedMtpLogprobCaptureMapsDifferentAcceptanceLengths
 
     auto identity_capture = captureMtpTargetLogprobs(logits, /*max_top_logprobs=*/2, /*real_vocab_size=*/5);
     EXPECT_EQ(identity_capture.raw_logits.data_ptr<at::Half>(), logits.data_ptr<at::Half>());
-    EXPECT_TRUE(identity_capture.requiresAsyncLmHeadReleaseSync());
+    EXPECT_TRUE(identity_capture.retainsFullLmHeadStorage());
 
     auto result = captureMtpTargetLogprobs(logits, /*max_top_logprobs=*/2, /*real_vocab_size=*/5, captured_dense_rows);
 
     ASSERT_EQ(result.raw_logits.sizes(), (torch::IntArrayRef{6, 5}));
     EXPECT_NE(result.raw_logits.data_ptr<at::Half>(), logits.data_ptr<at::Half>());
-    EXPECT_FALSE(result.requiresAsyncLmHeadReleaseSync());
+    EXPECT_FALSE(result.retainsFullLmHeadStorage());
     ASSERT_TRUE(result.source_row_indices_cpu_owner.defined());
     EXPECT_TRUE(result.source_row_indices_cpu_owner.is_pinned());
     EXPECT_EQ(toVec<int64_t>(result.source_row_indices_cpu_owner), captured_dense_rows);

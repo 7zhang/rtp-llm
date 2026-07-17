@@ -8,11 +8,11 @@
 
 namespace rtp_llm {
 
-// Target-model logprob state. Decode keeps all P+1 rows for each requesting
-// stream, but a mixed batch copies those rows into compact storage immediately
-// so async bookkeeping does not retain the full LM-head allocation. After
-// acceptance is known, bookkeeping selects the emitted rows and computes
-// reductions for those rows only. Eager prefill/tests may populate
+// Target-model logprob state. Decode keeps the complete dense target layout as
+// a zero-copy identity view until acceptance is known. It then selects only the
+// emitted rows belonging to requesting streams and computes reductions for
+// those rows. This avoids materializing a near-complete [R,V] copy for dense
+// mixed batches. Prefill/tests may still use sparse capture and may populate
 // row_logsumexp/top_logits before finalizeMtpTargetLogprobs().
 struct MtpTargetLogprobs {
     torch::Tensor raw_logits;     // raw dtype [captured_target_positions, real_vocab_size]
@@ -27,8 +27,8 @@ struct MtpTargetLogprobs {
     torch::Tensor token_logprobs;         // FP32 [selected_target_positions], defined after finalize
     torch::Tensor top_logprob_token_ids;  // INT32 [selected_target_positions, max_k]
     torch::Tensor top_logprobs;           // FP32 [selected_target_positions, max_k]
-    // Empty means raw row i is dense target row i (the all-request identity
-    // path). Otherwise compact raw row i corresponds to this dense target row.
+    // Empty means raw row i is dense target row i (the identity path).
+    // Otherwise compact raw row i corresponds to this dense target row.
     std::vector<int64_t> captured_dense_row_indices;
     int64_t              dense_row_count              = 0;
     bool                 retains_full_lm_head_storage = false;
@@ -50,16 +50,27 @@ struct MtpTargetLogprobs {
         return top_logits.defined() ? top_logits.size(1) : requested_top_logprobs;
     }
 
-    // A compact mixed-batch payload can overlap the next model allocation.
-    // The all-request identity view must be released first because it still
-    // aliases the complete LM-head output storage.
-    bool requiresAsyncLmHeadReleaseSync() const {
+    // Reports whether this payload still owns the complete LM-head output.
+    // Stream-async decode must finalize such an identity payload after current-
+    // step acceptance, overlapping draft-prefill work, before handing the
+    // compact result to regular bookkeeping or entering the next process.
+    bool retainsFullLmHeadStorage() const {
         return raw_logits.defined() && retains_full_lm_head_storage;
     }
 };
 
-// Identity capture is O(1). A sparse mixed-batch capture performs one compact
-// row copy, but no logsumexp or top-k is launched before acceptance is known.
+// Decode uses an identity capture for both all-request and mixed batches.
+// Stream-async decode finalizes that payload in the current step so draft work
+// and the next process do not retain the complete target LM-head storage.
+bool shouldFinalizeMtpTargetLogprobsEarly(bool stream_async_enabled, const MtpTargetLogprobs& target_logprobs);
+
+// Decode deliberately exposes no row-selection argument: even a 127/128 mixed
+// batch must remain an O(1) identity view until acceptance selects final rows.
+MtpTargetLogprobs
+captureMtpDecodeTargetLogprobs(const torch::Tensor& logits, int64_t max_top_logprobs, int64_t real_vocab_size);
+
+// Generic identity capture is O(1). Supplying sparse rows performs one compact
+// row copy for prefill/tests, but no logsumexp or top-k is launched.
 MtpTargetLogprobs captureMtpTargetLogprobs(const torch::Tensor&        logits,
                                            int64_t                     max_top_logprobs,
                                            int64_t                     real_vocab_size,
@@ -121,6 +132,13 @@ public:
                                 const speculative::SpeculativeSamplerOutput& spec_decode_output,
                                 const MergedOutput&                          draft_prefill_output,
                                 MtpTargetLogprobs                            target_logprobs) const;
+
+    // Wait for accepted lengths/tokens and reduce only accepted target rows.
+    // Idempotent for an already-finalized payload so an early async finalize
+    // can hand the compact result to the regular dispatch worker.
+    void finalizeDecodeTargetLogprobs(const StreamGroups&                          stream_groups,
+                                      const speculative::SpeculativeSamplerOutput& spec_decode_output,
+                                      MtpTargetLogprobs&                           target_logprobs) const;
 
     absl::StatusOr<GptModelInputs> gatherDecodeModelInput(const StreamGroups& stream_groups,
                                                           TensorHolder&       host_holder) const;

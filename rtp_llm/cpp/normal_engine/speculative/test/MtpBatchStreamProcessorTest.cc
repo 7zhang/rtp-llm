@@ -260,6 +260,18 @@ TEST_F(MtpBatchStreamProcessorTest, testDecodeTargetLogprobsCoverReplacementAcce
     auto target_logprobs = captureMtpTargetLogprobs(target_logits, 3, /*real_vocab_size=*/5);
     EXPECT_FALSE(target_logprobs.row_logsumexp.defined());
     EXPECT_FALSE(target_logprobs.top_logits.defined());
+    EXPECT_FALSE(shouldFinalizeMtpTargetLogprobsEarly(/*stream_async_enabled=*/false, target_logprobs));
+    EXPECT_TRUE(shouldFinalizeMtpTargetLogprobsEarly(/*stream_async_enabled=*/true, target_logprobs));
+
+    // Mirror the stream-async identity path: finalize accepted rows before the
+    // regular bookkeeping worker assembles StreamSpecUpdateInfo. The latter
+    // must consume this compact payload without attempting a second finalize.
+    processor.finalizeDecodeTargetLogprobs(stream_groups, spec_output, target_logprobs);
+    ASSERT_TRUE(target_logprobs.finalized());
+    ASSERT_FALSE(target_logprobs.retainsFullLmHeadStorage());
+    auto early_token_logprobs = target_logprobs.token_logprobs.clone();
+    auto early_top_ids        = target_logprobs.top_logprob_token_ids.clone();
+    auto early_top_logprobs   = target_logprobs.top_logprobs.clone();
 
     std::vector<StreamSpecUpdateInfo> update_infos;
     processor.prepareDecodeSpecUpdateInfo(
@@ -267,6 +279,9 @@ TEST_F(MtpBatchStreamProcessorTest, testDecodeTargetLogprobsCoverReplacementAcce
 
     ASSERT_EQ(update_infos.size(), 3);
     ASSERT_TRUE(target_logprobs.finalized());
+    EXPECT_TRUE(torch::equal(target_logprobs.token_logprobs, early_token_logprobs));
+    EXPECT_TRUE(torch::equal(target_logprobs.top_logprob_token_ids, early_top_ids));
+    EXPECT_TRUE(torch::equal(target_logprobs.top_logprobs, early_top_logprobs));
     // Only 1+2+3 accepted rows are reduced, rather than all 3*(P+1)=9.
     EXPECT_EQ(target_logprobs.token_logprobs.size(0), 6);
     const std::vector<int64_t> row_offsets = {0, 1, 3};
@@ -291,7 +306,7 @@ TEST_F(MtpBatchStreamProcessorTest, testDecodeTargetLogprobsCoverReplacementAcce
     }
 }
 
-TEST_F(MtpBatchStreamProcessorTest, testDecodeTargetLogprobsUseCompactOffsetsForMixedBatch) {
+TEST_F(MtpBatchStreamProcessorTest, testDecodeTargetLogprobsDeferMixedCompactionUntilAcceptance) {
     ModelConfig                 model_config;
     RuntimeConfig               runtime_config;
     SpeculativeExecutionConfig  sp_config;
@@ -326,13 +341,22 @@ TEST_F(MtpBatchStreamProcessorTest, testDecodeTargetLogprobsUseCompactOffsetsFor
                                           {1.0f, 0.0f, 5.0f, 4.0f, 3.0f},
                                           {2.0f, 1.0f, 0.0f, 5.0f, 3.0f}},
                                       torch::kFloat32);
-    auto target_logprobs = captureMtpTargetLogprobs(
-        dense_logits, /*max_top_logprobs=*/2, /*real_vocab_size=*/5, /*captured_dense_row_indices=*/{2, 3});
-    EXPECT_EQ(target_logprobs.raw_logits.size(0), 2);
+    auto target_logprobs = captureMtpDecodeTargetLogprobs(dense_logits, /*max_top_logprobs=*/2, /*real_vocab_size=*/5);
+    EXPECT_EQ(target_logprobs.raw_logits.size(0), 4);
     EXPECT_EQ(target_logprobs.dense_row_count, 4);
-    EXPECT_FALSE(target_logprobs.requiresAsyncLmHeadReleaseSync());
+    EXPECT_EQ(target_logprobs.raw_logits.data_ptr<float>(), dense_logits.data_ptr<float>());
+    EXPECT_TRUE(target_logprobs.captured_dense_row_indices.empty());
+    EXPECT_TRUE(target_logprobs.retainsFullLmHeadStorage());
+    EXPECT_TRUE(shouldFinalizeMtpTargetLogprobsEarly(/*stream_async_enabled=*/true, target_logprobs));
     EXPECT_FALSE(target_logprobs.row_logsumexp.defined());
     EXPECT_FALSE(target_logprobs.top_logits.defined());
+
+    // The mixed decode capture stays zero-copy until acceptance. Early finalize
+    // then reduces only the one accepted row belonging to the requesting
+    // stream; the regular worker consumes the compact result idempotently.
+    processor.finalizeDecodeTargetLogprobs(stream_groups, spec_output, target_logprobs);
+    ASSERT_TRUE(target_logprobs.finalized());
+    ASSERT_FALSE(target_logprobs.retainsFullLmHeadStorage());
 
     std::vector<StreamSpecUpdateInfo> update_infos;
     processor.prepareDecodeSpecUpdateInfo(stream_groups, spec_output, draft_output, target_logprobs, update_infos);
@@ -340,8 +364,8 @@ TEST_F(MtpBatchStreamProcessorTest, testDecodeTargetLogprobsUseCompactOffsetsFor
     ASSERT_EQ(update_infos.size(), 2);
     ASSERT_TRUE(target_logprobs.finalized());
     // The plain request contributes no rows, and the logprob request accepted
-    // only its first row. Its dense source row is 2, so this also verifies that
-    // emitted-token indexing keeps using the pre-compaction row layout.
+    // only its first row. Its dense source row is 2, proving selection was
+    // deferred until acceptance rather than captured as a [2,V] mixed copy.
     EXPECT_EQ(target_logprobs.token_logprobs.size(0), 1);
     EXPECT_FALSE(update_infos[0].token_logprobs.defined());
     EXPECT_FALSE(update_infos[0].top_logprob_token_ids.defined());
@@ -650,7 +674,7 @@ TEST_F(MtpBatchStreamProcessorTest, testGatherSpecSamplerInputPreservesPaddedLog
     EXPECT_TRUE(torch::equal(sampler_inputs.logits, original_logits));
 }
 
-TEST_F(MtpBatchStreamProcessorTest, testSpecMaskLeavesPaddedSamplerLogitsUnchanged) {
+TEST_F(MtpBatchStreamProcessorTest, testSpecMaskExcludesPaddedSamplerLogitsWithoutLogprobs) {
     ModelConfig                 model_config;
     RuntimeConfig               runtime_config;
     SpeculativeExecutionConfig  sp_config;
@@ -673,12 +697,17 @@ TEST_F(MtpBatchStreamProcessorTest, testSpecMaskLeavesPaddedSamplerLogitsUnchang
 
     GptModelInputs  model_inputs;
     GptModelOutputs model_output;
-    model_output.logits = torch::ones({2, 8}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    // Real token logits are all negative while padded LM-head columns are zero.
+    // Without suffix masking, greedy sampling would select OOV token 5.
+    model_output.logits = torch::tensor(
+        {{-5.0f, -4.0f, -3.0f, -2.0f, -1.0f, 0.0f, 0.0f, 0.0f}, {-1.0f, -2.0f, -3.0f, -4.0f, -5.0f, 0.0f, 0.0f, 0.0f}},
+        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    auto original_logits = model_output.logits.clone();
 
     SpecLogitsVerifyRunner::LaunchResult spec_mask_result;
     spec_mask_result.has_active_processor = true;
     spec_mask_result.spec_vocab_mask_gpu =
-        torch::tensor({{false, true, false, false, false}, {false, false, false, true, false}},
+        torch::tensor({{false, false, false, false, true}, {true, false, false, false, false}},
                       torch::TensorOptions().dtype(torch::kBool).device(torch::kCUDA));
 
     auto sampler_inputs_status =
@@ -690,15 +719,17 @@ TEST_F(MtpBatchStreamProcessorTest, testSpecMaskLeavesPaddedSamplerLogitsUnchang
     states.batchProcess(sampler_inputs);
     auto masked_logits = sampler_inputs.logits.cpu();
 
-    EXPECT_EQ(masked_logits.index({0, 0}).item<float>(), 1.0f);
-    EXPECT_EQ(masked_logits.index({0, 1}).item<float>(), BaseLogitsProcessor::neg_inf);
-    EXPECT_EQ(masked_logits.index({1, 3}).item<float>(), BaseLogitsProcessor::neg_inf);
+    EXPECT_EQ(masked_logits.index({0, 4}).item<float>(), BaseLogitsProcessor::neg_inf);
+    EXPECT_EQ(masked_logits.index({1, 0}).item<float>(), BaseLogitsProcessor::neg_inf);
     for (int64_t row = 0; row < 2; ++row) {
         for (int64_t col = 5; col < 8; ++col) {
-            EXPECT_EQ(masked_logits.index({row, col}).item<float>(), 1.0f);
+            EXPECT_EQ(masked_logits.index({row, col}).item<float>(), BaseLogitsProcessor::neg_inf);
         }
     }
-    EXPECT_TRUE(torch::equal(model_output.logits, torch::ones_like(model_output.logits)));
+    auto sampled_token_ids = masked_logits.argmax(/*dim=*/1);
+    EXPECT_EQ(toVec<int64_t>(sampled_token_ids), (std::vector<int64_t>{3, 1}));
+    EXPECT_TRUE(torch::all(sampled_token_ids < model_config.vocab_size).item<bool>());
+    EXPECT_TRUE(torch::equal(model_output.logits, original_logits));
 }
 
 TEST_F(MtpBatchStreamProcessorTest, testSpecSamplerInputMasksThinkBoundaryTokens) {

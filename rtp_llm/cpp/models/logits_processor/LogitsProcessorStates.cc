@@ -54,11 +54,17 @@ void LogitsProcessorStates::batchProcess(const SamplerInputs& inputs) {
         RTP_LLM_CHECK_WITH_INFO(inputs.spec_vocab_mask_gpu.size(1) <= inputs.logits.size(1),
                                 "MTP spec mask width must not exceed logits width");
         // The grammar/constraint mask is defined over the tokenizer's real
-        // vocabulary. LM-head logits can include TP-alignment columns; the MTP
-        // gatherer masks that tail separately, so avoid materializing a second
-        // full-width boolean tensor merely to satisfy masked_fill broadcasting.
-        inputs.logits.narrow(/*dim=*/1, /*start=*/0, inputs.spec_vocab_mask_gpu.size(1))
+        // vocabulary. LM-head logits can include TP-alignment columns, which
+        // are never valid tokens and must be masked in the same constrained
+        // path. Keep the real-vocab mask compact and fill the suffix directly.
+        const int64_t real_vocab_size = inputs.spec_vocab_mask_gpu.size(1);
+        inputs.logits.narrow(/*dim=*/1, /*start=*/0, real_vocab_size)
             .masked_fill_(inputs.spec_vocab_mask_gpu, BaseLogitsProcessor::neg_inf);
+        if (real_vocab_size < inputs.logits.size(1)) {
+            inputs.logits
+                .narrow(/*dim=*/1, /*start=*/real_vocab_size, /*length=*/inputs.logits.size(1) - real_vocab_size)
+                .fill_(BaseLogitsProcessor::neg_inf);
+        }
     }
 
     for (size_t i = 0; i < logits_processors_.size(); i++) {

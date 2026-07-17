@@ -78,8 +78,9 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
     const size_t total_batch_size_out = stream_groups.totalSamplerBatchSizeOut();
     RTP_LLM_CHECK(total_batch_size_out == (size_t)sampler_output.token_ids.size(0));
 
-    auto all_streams     = stream_groups.allStreams();
-    bool any_beam_search = false;
+    auto       all_streams          = stream_groups.allStreams();
+    const bool need_return_logprobs = stream_groups.needReturnLogProbs();
+    bool       any_beam_search      = false;
     if (sampler_output.token_ids.defined() && sampler_output.token_ids.size(1) > 1) {
         for (const auto& stream : all_streams) {
             if (stream->currentNumBeams() > 1 || stream->nextNumBeams() > 1) {
@@ -107,37 +108,39 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
     std::vector<int64_t> requested_output_model_rows;
     int64_t              model_batch_idx  = 0;
     int64_t              output_batch_idx = 0;
-    for (const auto& stream : all_streams) {
-        const int64_t cur_batch_size  = stream->currentBatchSize();
-        const int64_t next_batch_size = stream->nextBatchSize();
-        if (stream->generateConfig()->return_logprobs) {
-            for (int64_t i = 0; i < cur_batch_size; ++i) {
-                expected_raw_row_indices.push_back(model_batch_idx + i);
-            }
-
-            const bool    has_beam_search = stream->currentNumBeams() > 1 || stream->nextNumBeams() > 1;
-            const bool    has_var_batch   = cur_batch_size != next_batch_size;
-            torch::Tensor src_batch_indices;
-            if (has_beam_search) {
-                RTP_LLM_CHECK(sampler_output.beam_index.defined());
-                RTP_LLM_CHECK(!sampler_output.beam_index.is_cuda());
-                src_batch_indices = sampler_output.beam_index.narrow(0, output_batch_idx, next_batch_size);
-            }
-            for (int64_t i = 0; i < next_batch_size; ++i) {
-                int64_t src_idx = i;
-                if (src_batch_indices.defined()) {
-                    src_idx = src_batch_indices.data_ptr<int32_t>()[i];
-                } else if (has_var_batch) {
-                    // Context-to-decode tiling duplicates the single model row.
-                    src_idx = 0;
+    if (need_return_logprobs) {
+        for (const auto& stream : all_streams) {
+            const int64_t cur_batch_size  = stream->currentBatchSize();
+            const int64_t next_batch_size = stream->nextBatchSize();
+            if (stream->generateConfig()->return_logprobs) {
+                for (int64_t i = 0; i < cur_batch_size; ++i) {
+                    expected_raw_row_indices.push_back(model_batch_idx + i);
                 }
-                RTP_LLM_CHECK(src_idx >= 0 && src_idx < cur_batch_size);
-                requested_output_row_indices.push_back(output_batch_idx + i);
-                requested_output_model_rows.push_back(model_batch_idx + src_idx);
+
+                const bool    has_beam_search = stream->currentNumBeams() > 1 || stream->nextNumBeams() > 1;
+                const bool    has_var_batch   = cur_batch_size != next_batch_size;
+                torch::Tensor src_batch_indices;
+                if (has_beam_search) {
+                    RTP_LLM_CHECK(sampler_output.beam_index.defined());
+                    RTP_LLM_CHECK(!sampler_output.beam_index.is_cuda());
+                    src_batch_indices = sampler_output.beam_index.narrow(0, output_batch_idx, next_batch_size);
+                }
+                for (int64_t i = 0; i < next_batch_size; ++i) {
+                    int64_t src_idx = i;
+                    if (src_batch_indices.defined()) {
+                        src_idx = src_batch_indices.data_ptr<int32_t>()[i];
+                    } else if (has_var_batch) {
+                        // Context-to-decode tiling duplicates the single model row.
+                        src_idx = 0;
+                    }
+                    RTP_LLM_CHECK(src_idx >= 0 && src_idx < cur_batch_size);
+                    requested_output_row_indices.push_back(output_batch_idx + i);
+                    requested_output_model_rows.push_back(model_batch_idx + src_idx);
+                }
             }
+            model_batch_idx += cur_batch_size;
+            output_batch_idx += next_batch_size;
         }
-        model_batch_idx += cur_batch_size;
-        output_batch_idx += next_batch_size;
     }
 
     torch::Tensor compact_token_logprobs;
@@ -152,7 +155,7 @@ absl::Status NormalOutputDispatcher::dispatch(const StreamGroups& stream_groups,
         index_host_buffers.emplace_back(std::move(host_tensor));
         return device_tensor;
     };
-    if (stream_groups.needReturnLogProbs()) {
+    if (need_return_logprobs) {
         RTP_LLM_CHECK(!expected_raw_row_indices.empty());
         RTP_LLM_CHECK(!requested_output_row_indices.empty());
 
