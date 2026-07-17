@@ -197,6 +197,29 @@ class GenerateConfigTest(TestCase):
         self.assertEqual(generate_config.in_think_mode, True)
         self.assertEqual(generate_config.end_think_token_ids, [102])
 
+    def test_add_thinking_params_consumes_canonical_unicode_tag(self):
+        class RecordingTokenizer:
+            def __init__(self):
+                self.encode_calls = []
+
+            def encode(self, text, add_special_tokens=True):
+                self.encode_calls.append((text, add_special_tokens))
+                return [17, 18]
+
+        generate_env_config = GenerateEnvConfig()
+        generate_env_config.think_mode = 1
+        generate_env_config.think_end_token_id = -1
+        generate_env_config.think_end_tag = "</思考>\n\n"
+        tokenizer = RecordingTokenizer()
+        generate_config = GenerateConfig.create_generate_config(
+            self._create_generate_config()
+        )
+
+        generate_config.add_thinking_params(tokenizer, generate_env_config)
+
+        self.assertEqual(generate_config.end_think_token_ids, [17, 18])
+        self.assertEqual(tokenizer.encode_calls, [("</思考>\n\n", False)])
+
     def test_add_thinking_params_with_think_token(self):
         generate_env_config = GenerateEnvConfig()
         generate_env_config.think_mode = 1

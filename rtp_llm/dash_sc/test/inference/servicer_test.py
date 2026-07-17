@@ -192,6 +192,34 @@ def _dsv4_tokenizer() -> _FakeTokenizer:
     )
 
 
+class BuildThinkRuntimeTest(unittest.TestCase):
+    def test_consumes_normalized_unicode_tags_verbatim(self) -> None:
+        generate_env_config = _GenerateEnvCfg()
+        generate_env_config.think_start_tag = "<思考>\n"
+        generate_env_config.think_end_tag = "</思考>\n\n"
+        tokenizer = _FakeTokenizer(
+            {
+                "<思考>\n": [11, 12],
+                "</思考>\n\n": [13, 14],
+                "<思考>\n\n</思考>\n\n": [11, 15, 13, 14],
+            }
+        )
+
+        runtime = build_think_runtime(tokenizer, generate_env_config, "deepseek_v4")
+
+        self.assertEqual(runtime.bos_tokens, (11, 12))
+        self.assertEqual(runtime.eos_tokens, (13, 14))
+        self.assertEqual(runtime.empty_tokens, (11, 15, 13, 14))
+        self.assertEqual(
+            tokenizer.encode_calls,
+            [
+                ("<思考>\n", False),
+                ("</思考>\n\n", False),
+                ("<思考>\n\n</思考>\n\n", False),
+            ],
+        )
+
+
 async def _drain(aiter):
     return [x async for x in aiter]
 

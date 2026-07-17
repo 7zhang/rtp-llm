@@ -45,7 +45,25 @@ class _CancelableStream(Protocol):
 @runtime_checkable
 class _AsyncClosableStream(Protocol):
     async def aclose(self) -> None: ...
+
+
 _CHANNEL_CLEANUP_INTERVAL_S = 60
+
+
+def _merge_forward_channel_options(dash_sc_grpc_config) -> list[tuple[str, int]]:
+    """Merge proxy defaults with explicit client config.
+
+    ``DashScGrpcConfig.client_config`` is the operator-facing contract for
+    outbound channel options, so explicitly configured values take precedence.
+    Proxy keepalive values only fill keys the operator did not configure.
+    """
+    merged = dict(_FORWARD_CHANNEL_OPTS)
+    if dash_sc_grpc_config is not None:
+        merged.update(
+            (str(key), int(value))
+            for key, value in dash_sc_grpc_config.get_client_config().items()
+        )
+    return sorted(merged.items())
 
 
 def _is_stream_done(resp: predict_v2_pb2.ModelStreamInferResponse) -> bool:
@@ -64,7 +82,7 @@ def _invalid_max_new_tokens_message(request) -> str | None:
     if max_new_tokens > 0:
         return None
     param_name = "max_completion_tokens" if from_completion_alias else "max_new_tokens"
-    return f"invalid {param_name}: {max_new_tokens}; " "must be greater than 0"
+    return f"invalid {param_name}: {max_new_tokens}; must be greater than 0"
 
 
 async def _close_request_iterator_quietly(request_iter) -> None:
@@ -92,9 +110,10 @@ class DashScProxyServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
         *,
         rank_id: Optional[int] = None,
         server_id: str = "",
+        dash_sc_grpc_config=None,
     ):
         self._channel_pool = GrpcHostChannelPool(
-            options=_FORWARD_CHANNEL_OPTS,
+            options=_merge_forward_channel_options(dash_sc_grpc_config),
             cleanup_interval=_CHANNEL_CLEANUP_INTERVAL_S,
         )
         self._discovery = create_service_discovery_from_env()

@@ -320,6 +320,66 @@ class ServerArgsSetTest(TestCase):
         self.assertEqual(cfg.tool_call_loop_begin_marker, "<tool_call>")
         self.assertEqual(cfg.tool_call_loop_end_marker, "</tool_call>")
 
+    def test_think_tag_normalizer_decodes_one_unicode_safe_layer(self):
+        from rtp_llm.server.server_args.generate_group_args import normalize_think_tag
+
+        cases = (
+            ("<think>\n", "<think>\n"),
+            ("<think>\\n", "<think>\n"),
+            ("<think>\\\\n", "<think>\\n"),
+            ("<思考>\\n", "<思考>\n"),
+        )
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_think_tag(raw), expected)
+
+    def test_think_tag_server_arg_defaults_are_canonical(self):
+        sys.argv = ["prog"]
+
+        import rtp_llm.server.server_args.server_args
+
+        importlib.reload(rtp_llm.server.server_args.server_args)
+        generate_config = (
+            rtp_llm.server.server_args.server_args.setup_args().generate_env_config
+        )
+
+        self.assertEqual(generate_config.think_start_tag, "<think>\n")
+        self.assertEqual(generate_config.think_end_tag, "</think>\n\n")
+
+    def test_literal_env_think_tags_are_normalized_without_unicode_loss(self):
+        os.environ["THINK_START_TAG"] = "<思考>\\n"
+        os.environ["THINK_END_TAG"] = "</思考>\\n\\n"
+        sys.argv = ["prog"]
+
+        import rtp_llm.server.server_args.server_args
+
+        importlib.reload(rtp_llm.server.server_args.server_args)
+        generate_config = (
+            rtp_llm.server.server_args.server_args.setup_args().generate_env_config
+        )
+
+        self.assertEqual(generate_config.think_start_tag, "<思考>\n")
+        self.assertEqual(generate_config.think_end_tag, "</思考>\n\n")
+
+    def test_literal_cli_think_tags_are_normalized_without_unicode_loss(self):
+        sys.argv = [
+            "prog",
+            "--think_start_tag",
+            "<分析>\\n",
+            "--think_end_tag",
+            "</分析>\\n\\n",
+        ]
+
+        import rtp_llm.server.server_args.server_args
+
+        importlib.reload(rtp_llm.server.server_args.server_args)
+        generate_config = (
+            rtp_llm.server.server_args.server_args.setup_args().generate_env_config
+        )
+
+        self.assertEqual(generate_config.think_start_tag, "<分析>\n")
+        self.assertEqual(generate_config.think_end_tag, "</分析>\n\n")
+
     def test_dash_sc_default_allows_large_requests_on_both_ends(self):
         from rtp_llm.server.server_args.grpc_group_args import (
             default_dash_sc_grpc_config_json,

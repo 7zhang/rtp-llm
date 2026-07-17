@@ -150,11 +150,6 @@ def _derive_max_token_id(tokenizer: Any) -> Optional[int]:
     return size - 1 if size > 0 else None
 
 
-def _decode_env_tag(value: str) -> str:
-    """Unescape literal ``\\n`` etc. from a configured thinking tag."""
-    return str(value).encode("utf-8").decode("unicode_escape")
-
-
 def _encode_tag(tokenizer: Any, text: str) -> list[int]:
     if tokenizer is None or not text:
         return []
@@ -266,8 +261,8 @@ def build_think_runtime(
             eos_token_id=eos_tid,
             max_token_id=max_tid,
         )
-    think_start_tag = _decode_env_tag(generate_env_config.think_start_tag)
-    think_end_tag = _decode_env_tag(generate_env_config.think_end_tag)
+    think_start_tag = generate_env_config.think_start_tag
+    think_end_tag = generate_env_config.think_end_tag
     bos_tokens = tuple(_encode_tag(tokenizer, think_start_tag))
     eos_tokens = tuple(_encode_tag(tokenizer, think_end_tag))
     empty_tokens = tuple(
@@ -889,22 +884,23 @@ async def iter_real_model_stream_infer(
                 phase2_generate_input,
             )
             phase2_stream = await backend_visitor.enqueue(phase2_generate_input)
-            phase2_cumulative_sent_ids: list[int] = []
+            phase2_sent_token_count = 0
             phase2_received_output = False
             phase2_received_finished = False
 
             def _build_phase2_response(
                 resp_go: Any,
             ) -> predict_v2_pb2.ModelStreamInferResponse:
+                nonlocal phase2_sent_token_count
                 resp_out = resp_go.generate_outputs[0]
                 resp_ids = _token_ids_list_from_generate_output(resp_out)
-                phase2_cumulative_sent_ids.extend(resp_ids)
+                phase2_sent_token_count += len(resp_ids)
                 phase2_max_new_tokens = int(phase2_config.max_new_tokens or 0)
                 finish_reason_override = None
                 if (
                     resp_out.finished
                     and phase2_max_new_tokens > 0
-                    and len(phase2_cumulative_sent_ids) >= phase2_max_new_tokens
+                    and phase2_sent_token_count >= phase2_max_new_tokens
                 ):
                     finish_reason_override = LLMFinishReason.LENGTH
                 response_finished = bool(resp_out.finished)
@@ -974,12 +970,13 @@ async def iter_real_model_stream_infer(
             #     Pre-close tokens ARE the real content. Keep them, drop only
             #     the trailing close + eos rest.
             #
-            # The two cases are distinguished by whether tokens follow the
-            # close: post-close non-empty → Case A; post-close empty AND chunk
-            # finished → Case B; otherwise ambiguous (close split across
-            # chunks) → default to Case A so the next chunk's content streams
-            # cleanly. Pre-close chunks are buffered in ``phase2_pending``
-            # until classification completes.
+            # Intentional trade-off: keep buffering until a close tag or the
+            # finished frame. Before then, pre-close tokens cannot be classified
+            # reliably as accidental reasoning or real answer content. This makes
+            # a no-close phase-2 response non-streaming and retains O(output)
+            # pending chunks. We accept that cost instead of adding a bounded
+            # early flush that would knowingly leak late reasoning into ``content``.
+            # This is a deliberate protocol choice, not a missing streaming yield.
             phase2_pending: list[Any] = []
             phase2_seen_close = False
 

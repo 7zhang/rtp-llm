@@ -196,34 +196,24 @@ async def _create_proxy_servicer_on_loop(
     *,
     rank_id: Optional[int] = None,
     server_id: str = "",
+    dash_sc_grpc_config: Any = None,
 ) -> DashScProxyServicer:
     """Construct proxy servicer inside the running asyncio owner loop.
 
     Outbound ``grpc.aio.Channel`` objects are event-loop affine, but the shared
     channel cache builds them lazily when a request first uses an address.
     """
-    return DashScProxyServicer(rank_id=rank_id, server_id=server_id)
+    return DashScProxyServicer(
+        rank_id=rank_id,
+        server_id=server_id,
+        dash_sc_grpc_config=dash_sc_grpc_config,
+    )
 
 
-def _derive_echo_prefix_ids(generate_env_config: Any, base_tok: Any) -> List[int]:
-    """Encode ``generate_env_config.think_start_tag`` once to produce the prefill token ids.
-
-    Disabled (returns ``[]``) when ``THINK_MODE`` env is off or ``think_start_tag`` is empty;
-    stays aligned with the engine's thinking switch so dash_sc and the engine turn on/off
-    together. Fail-open: any error returns ``[]`` and logs a warning.
-    """
-    if not bool(generate_env_config.think_mode):
-        return []
-    tag = generate_env_config.think_start_tag
-    if not tag:
-        return []
-    try:
-        hf_tok = base_tok.tokenizer
-        ids = list(hf_tok.encode(tag, add_special_tokens=False))
-    except Exception as e:
-        logging.warning("[DashScApp] echo_prefix derive failed: %s", e)
-        return []
-    logging.info("[DashScApp] echo_prefix_ids=%s (think_start_tag=%r)", ids, tag)
+def _derive_echo_prefix_ids(think_runtime: Any) -> List[int]:
+    """Return canonical think-BOS candidates for per-request tail matching."""
+    ids = list(think_runtime.bos_tokens)
+    logging.info("[DashScApp] echo_prefix_ids=%s", ids)
     return ids
 
 
@@ -506,29 +496,26 @@ class DashScApp:
                     model_config.tokenizer_path,
                     model_config.model_type,
                 )
-                echo_prefix_ids = _derive_echo_prefix_ids(
-                    self.py_env_configs.generate_env_config, base_tok
+                generate_env_config = self.py_env_configs.generate_env_config
+                # ``think_terminate_token_id`` <= 0 means the operator turned off
+                # the in-stream "stop thinking" branch via env/args; carry that
+                # through as ``None`` so the servicer skips the path entirely.
+                env_terminate_id = generate_env_config.think_terminate_token_id
+                think_runtime = build_think_runtime(
+                    base_tok.tokenizer,
+                    generate_env_config,
+                    model_config.model_type,
+                    terminate_token_id=(
+                        env_terminate_id if env_terminate_id > 0 else None
+                    ),
                 )
+                echo_prefix_ids = _derive_echo_prefix_ids(think_runtime)
                 extra_stop_word_ids = _derive_stop_word_ids_list(
                     model_config, self.py_env_configs, base_tok
                 )
                 repetition_monitor_config = _build_repetition_monitor_config(
                     self.py_env_configs.repetition_detection_config,
                     base_tok,
-                )
-                # ``think_terminate_token_id`` <= 0 means the operator turned off
-                # the in-stream "stop thinking" branch via env/args; carry that
-                # through as ``None`` so the servicer skips the path entirely.
-                env_terminate_id = (
-                    self.py_env_configs.generate_env_config.think_terminate_token_id
-                )
-                think_runtime = build_think_runtime(
-                    base_tok.tokenizer,
-                    self.py_env_configs.generate_env_config,
-                    model_config.model_type,
-                    terminate_token_id=(
-                        env_terminate_id if env_terminate_id > 0 else None
-                    ),
                 )
                 servicer = DashScInferenceServicer(
                     backend_visitor=backend_visitor,
@@ -538,7 +525,7 @@ class DashScApp:
                     echo_prefix_ids=echo_prefix_ids,
                     extra_stop_word_ids=extra_stop_word_ids,
                     tokenizer=base_tok.tokenizer,
-                    generate_env_config=self.py_env_configs.generate_env_config,
+                    generate_env_config=generate_env_config,
                     think_runtime=think_runtime,
                     rank_id=self.server_config.rank_id,
                     repetition_monitor_config=repetition_monitor_config,
@@ -551,6 +538,7 @@ class DashScApp:
                     _create_proxy_servicer_on_loop(
                         rank_id=self.server_config.rank_id,
                         server_id=self.server_config.frontend_server_id,
+                        dash_sc_grpc_config=self.dash_sc_grpc_config,
                     ),
                     loop,
                 )

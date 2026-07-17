@@ -526,9 +526,7 @@ class GenerateConfig(BaseModel):
             and tokenizer
             and end_think_token_id == -1
         ):
-            think_end_tag: str = generate_env_config.think_end_tag.encode(
-                "utf-8"
-            ).decode("unicode_escape")
+            think_end_tag: str = generate_env_config.think_end_tag
             tokenized_result: List[int] = tokenizer.encode(
                 think_end_tag, add_special_tokens=False
             )

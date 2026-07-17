@@ -141,6 +141,7 @@ def _servicer_pool(servicer):
 
 def _make_servicer(
     forward_addrs: list[str],
+    dash_sc_grpc_config=None,
 ) -> DashScProxyServicer:
     address = ";".join(forward_addrs)
     saved_route = os.environ.get(SERVICE_ROUTE_ENV_KEY)
@@ -148,7 +149,7 @@ def _make_servicer(
         os.environ[SERVICE_ROUTE_ENV_KEY] = json.dumps(
             {"type": "ip_port_list", "address": address}
         )
-        return DashScProxyServicer()
+        return DashScProxyServicer(dash_sc_grpc_config=dash_sc_grpc_config)
     finally:
         if saved_route is None:
             os.environ.pop(SERVICE_ROUTE_ENV_KEY, None)
@@ -843,6 +844,35 @@ class ChannelLoopAffinityTest(unittest.TestCase):
 
 class ChannelPoolTest(unittest.IsolatedAsyncioTestCase):
     """Dash SC reuses the shared lazy per-address gRPC channel cache."""
+
+    async def test_client_config_reaches_insecure_channel_and_overrides_defaults(
+        self,
+    ) -> None:
+        config = MagicMock()
+        config.get_client_config.return_value = {
+            "grpc.keepalive_time_ms": 45000,
+            "grpc.max_receive_message_length": 123456,
+        }
+        with patch(
+            "rtp_llm.utils.grpc_host_channel_pool.aio.insecure_channel",
+            side_effect=lambda addr, **_kwargs: _FakeChannel(addr),
+        ) as mock_ch:
+            servicer = _make_servicer(["10.0.0.1:8096"], dash_sc_grpc_config=config)
+            try:
+                await _servicer_pool(servicer).get("10.0.0.1:8104")
+            finally:
+                await servicer.close()
+
+        self.assertEqual(mock_ch.call_args.args[0], "10.0.0.1:8104")
+        option_pairs = mock_ch.call_args.kwargs["options"]
+        options = dict(option_pairs)
+        self.assertEqual(len(option_pairs), len(options))
+        self.assertEqual(options["grpc.keepalive_time_ms"], 45000)
+        self.assertEqual(options["grpc.keepalive_timeout_ms"], 10000)
+        self.assertEqual(options["grpc.keepalive_permit_without_calls"], 0)
+        self.assertEqual(options["grpc.http2.max_pings_without_data"], 0)
+        self.assertEqual(options["grpc.max_receive_message_length"], 123456)
+        config.get_client_config.assert_called_once_with()
 
     async def test_open_does_not_prewarm_configured_addrs(self) -> None:
         with patch(
