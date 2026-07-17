@@ -131,8 +131,8 @@ class DashScProxyServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
         logging.info("[DashScGrpc] DashScProxyServicer configured")
 
     async def open(self) -> None:
-        """Keep the proxy lifecycle hook explicit; channels are opened lazily."""
-        return
+        """Warm dynamic discovery; outbound channels are still opened lazily."""
+        await self._discovery.prewarm()
 
     async def close(self) -> None:
         """Drain and close channel-cache resources. Safe to call multiple times.
@@ -140,7 +140,10 @@ class DashScProxyServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
         Called after ``server.stop(grace)`` has let in-flight RPCs finish, so
         the cache's force-close of any residue cannot interrupt a live RPC.
         """
-        await self._channel_pool.close()
+        try:
+            await self._discovery.close()
+        finally:
+            await self._channel_pool.close()
 
     def _record_and_report_chunk(self, record: GrpcAccessRecord, resp) -> None:
         """Capture the frame and fan out per-chunk metrics (records, no log)."""
@@ -210,7 +213,7 @@ class DashScProxyServicer(predict_v2_pb2_grpc.GRPCInferenceServiceServicer):
                 finally:
                     record.mark_request_done(status)
 
-            route_addr = self._discovery.resolve()
+            route_addr = await self._discovery.resolve_async()
             if route_addr is None:
                 record.mark_request_done("eof")
                 msg = "forward backend unavailable"

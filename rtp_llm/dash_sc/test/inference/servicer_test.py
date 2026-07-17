@@ -299,6 +299,37 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
         _add_input_tensor(req, "input_ids", "INT32", [2], struct.pack("<2i", 1, 2))
         return req
 
+    async def _run_dsv4_phase2(self, phase2_chunks, tokenizer=None):
+        phase1 = GenerateOutputs(
+            generate_outputs=[
+                GenerateOutput(
+                    output_ids=torch.tensor([10, 1], dtype=torch.int32),
+                    finished=False,
+                    aux_info=AuxInfo(input_len=4, reuse_len=0),
+                )
+            ]
+        )
+        visitor = _MultiStreamVisitor(
+            [_FakeAsyncStream([phase1]), _FakeAsyncStream(phase2_chunks)]
+        )
+        tok = tokenizer or _dsv4_tokenizer()
+        env_cfg = _GenerateEnvCfg()
+        return await _drain(
+            iter_real_model_stream_infer(
+                self._minimal_request(),
+                [7, 8, 128821],
+                SamplingParams(),
+                OtherParams(enable_thinking=True),
+                visitor,
+                rtp_llm_request_id=100,
+                echo_prefix_ids=[128821, 198],
+                tokenizer=tok,
+                generate_env_config=env_cfg,
+                think_runtime=build_think_runtime(tok, env_cfg, "deepseek_v4"),
+                phase2_request_id_factory=lambda: 200,
+            )
+        )
+
     async def test_yields_one_chunk_from_mock_enqueue(self) -> None:
         req = self._minimal_request()
         out = GenerateOutput(
@@ -1560,6 +1591,97 @@ class IterRealModelStreamInferTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(phase2_chunks), 1)
         # Trailing [128822, 271] is stripped; only the real answer ids survive.
         self.assertEqual(_gen_ids(phase2_chunks[0]), [30, 31, 32])
+
+    async def test_phase2_strips_close_marker_split_across_chunks(self) -> None:
+        chunks = await self._run_dsv4_phase2(
+            [
+                GenerateOutputs(
+                    generate_outputs=[
+                        GenerateOutput(
+                            output_ids=torch.tensor(
+                                [55, 56, 128822], dtype=torch.int32
+                            ),
+                            finished=False,
+                            aux_info=AuxInfo(input_len=4, reuse_len=0),
+                        )
+                    ]
+                ),
+                GenerateOutputs(
+                    generate_outputs=[
+                        GenerateOutput(
+                            output_ids=torch.tensor([271, 20, 21], dtype=torch.int32),
+                            finished=True,
+                            aux_info=AuxInfo(input_len=4, reuse_len=0),
+                        )
+                    ]
+                ),
+            ]
+        )
+
+        phase2_chunks = [c for c in chunks if c.infer_response.id.endswith("-2")]
+        self.assertEqual([_gen_ids(c) for c in phase2_chunks], [[20, 21]])
+        self.assertTrue(_finished(phase2_chunks[-1]))
+
+    async def test_phase2_preserves_answer_before_split_trailing_marker(self) -> None:
+        chunks = await self._run_dsv4_phase2(
+            [
+                GenerateOutputs(
+                    generate_outputs=[
+                        GenerateOutput(
+                            output_ids=torch.tensor(
+                                [30, 31, 32, 128822], dtype=torch.int32
+                            ),
+                            finished=False,
+                            aux_info=AuxInfo(input_len=4, reuse_len=0),
+                        )
+                    ]
+                ),
+                GenerateOutputs(
+                    generate_outputs=[
+                        GenerateOutput(
+                            output_ids=torch.tensor([271], dtype=torch.int32),
+                            finished=True,
+                            aux_info=AuxInfo(input_len=4, reuse_len=0),
+                        )
+                    ]
+                ),
+            ]
+        )
+
+        phase2_chunks = [c for c in chunks if c.infer_response.id.endswith("-2")]
+        generated_ids = [tid for chunk in phase2_chunks for tid in _gen_ids(chunk)]
+        self.assertEqual(generated_ids, [30, 31, 32])
+        self.assertTrue(_finished(phase2_chunks[-1]))
+
+    async def test_phase2_keeps_partial_close_suffix_at_eof(self) -> None:
+        tok = _FakeTokenizer(
+            {
+                "<think>\n": [128821, 198],
+                "</think>\n\n": [128822, 271, 272],
+                "<think>\n\n</think>\n\n": [128821, 271, 128822, 271, 272],
+                "</think>": [128822],
+            }
+        )
+        chunks = await self._run_dsv4_phase2(
+            [
+                GenerateOutputs(
+                    generate_outputs=[
+                        GenerateOutput(
+                            output_ids=torch.tensor(
+                                [55, 128822, 271], dtype=torch.int32
+                            ),
+                            finished=True,
+                            aux_info=AuxInfo(input_len=4, reuse_len=0),
+                        )
+                    ]
+                )
+            ],
+            tokenizer=tok,
+        )
+
+        phase2_chunks = [c for c in chunks if c.infer_response.id.endswith("-2")]
+        self.assertEqual([_gen_ids(c) for c in phase2_chunks], [[271]])
+        self.assertTrue(_finished(phase2_chunks[-1]))
 
 
 class IterRealModelStreamInferEchoTest(unittest.IsolatedAsyncioTestCase):

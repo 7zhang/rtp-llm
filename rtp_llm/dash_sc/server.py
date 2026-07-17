@@ -280,7 +280,13 @@ class DashScGrpcServer:
             ),
             loop,
         )
-        fut.result(timeout=startup_timeout_s)
+        try:
+            fut.result(timeout=startup_timeout_s)
+        except BaseException:
+            # Prevent a timed-out start coroutine from binding a server later
+            # while the caller is already tearing down the owner loop.
+            fut.cancel()
+            raise
         self._loop = loop
 
     def stop(self, grace: Optional[float] = None) -> None:

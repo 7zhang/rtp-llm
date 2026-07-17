@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import json
 import sys
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from types import ModuleType
 from unittest import TestCase, main
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from rtp_llm.dash_sc.server import dash_sc_grpc_server_channel_options
+from rtp_llm.dash_sc.server import (
+    DashScGrpcServer,
+    dash_sc_grpc_server_channel_options,
+)
 
 
 class _FakeDashScGrpcConfig:
@@ -32,6 +36,29 @@ class DashScGrpcServerChannelOptionsTest(TestCase):
             options["grpc.max_receive_message_length"],
             64 * 1024 * 1024,
         )
+
+    def test_start_timeout_cancels_submitted_coroutine(self) -> None:
+        future = MagicMock()
+        future.result.side_effect = FutureTimeoutError()
+
+        def submit(coro, _loop):
+            coro.close()
+            return future
+
+        server = DashScGrpcServer(dash_sc_grpc_config=MagicMock())
+        with patch(
+            "rtp_llm.dash_sc.server.asyncio.run_coroutine_threadsafe",
+            side_effect=submit,
+        ):
+            with self.assertRaises(FutureTimeoutError):
+                server.start_on_loop(
+                    MagicMock(),
+                    port=12345,
+                    servicer=MagicMock(),
+                    startup_timeout_s=0.01,
+                )
+
+        future.cancel.assert_called_once_with()
 
 
 if __name__ == "__main__":

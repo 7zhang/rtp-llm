@@ -313,25 +313,19 @@ def _strip_trailing_eos(
 def _split_on_first_close(
     generated_ids: list[int],
     close_token_id: Optional[int],
-    eos_seq: tuple[int, ...],
 ) -> tuple[Optional[int], list[int]]:
-    """Find the first ``close_token_id`` and return ``(idx, post_close_ids)``.
+    """Find the first ``close_token_id`` and return ``(idx, close_candidate)``.
 
-    The post-close suffix has the rest of ``eos_seq`` consumed if it appears
-    immediately after the close token, so a multi-token ``</think>\\n\\n`` is
-    treated as a single boundary. Returns ``(None, generated_ids)`` if the
-    close token is not present.
+    ``close_candidate`` starts with the close token itself. The caller keeps
+    this short candidate across backend chunks so a multi-token
+    ``</think>\\n\\n`` boundary can be matched without leaking its suffix.
+    Returns ``(None, generated_ids)`` if the close token is not present.
     """
     if close_token_id is None:
         return None, list(generated_ids)
     for i, tid in enumerate(generated_ids):
         if tid == close_token_id:
-            tail_start = i + 1
-            if len(eos_seq) > 1:
-                rest = list(eos_seq[1:])
-                if list(generated_ids[tail_start : tail_start + len(rest)]) == rest:
-                    tail_start += len(rest)
-            return i, list(generated_ids[tail_start:])
+            return i, list(generated_ids[i:])
     return None, list(generated_ids)
 
 
@@ -979,6 +973,12 @@ async def iter_real_model_stream_infer(
             # This is a deliberate protocol choice, not a missing streaming yield.
             phase2_pending: list[Any] = []
             phase2_seen_close = False
+            # Starts at the first close token and is held only until we can
+            # distinguish ``marker + content`` (Case A) from ``marker + EOF``
+            # (Case B). Keeping the candidate across chunks prevents the tail
+            # of a multi-token marker from leaking into content.
+            phase2_close_candidate: Optional[list[int]] = None
+            phase2_close_marker = list(runtime.eos_tokens)
 
             def _flush_phase2_pending() -> (
                 Iterator[predict_v2_pb2.ModelStreamInferResponse]
@@ -1023,22 +1023,56 @@ async def iter_real_model_stream_infer(
                         yield (resp, stats) if yield_access_stats else resp
                     continue
 
-                close_idx, post_close = _split_on_first_close(
-                    generated_ids, think_close_token_id, runtime.eos_tokens
+                current_go_in_pending = False
+                if phase2_close_candidate is None:
+                    close_idx, close_candidate = _split_on_first_close(
+                        generated_ids, think_close_token_id
+                    )
+                    if close_idx is None:
+                        phase2_pending.append(go)
+                        if out_py.finished:
+                            # No close ever — buffered chunks are all content.
+                            for item in _flush_phase2_pending():
+                                yield item
+                            phase2_pending = []
+                        continue
+
+                    pre_close = list(generated_ids[:close_idx])
+                    out_py.output_ids = torch.tensor(pre_close, dtype=torch.int32)
+                    if pre_close or out_py.finished:
+                        phase2_pending.append(go)
+                        current_go_in_pending = True
+                    phase2_close_candidate = close_candidate
+                else:
+                    phase2_close_candidate.extend(generated_ids)
+
+                # The first token is the definitive close token. Match the
+                # remaining configured marker across chunks before deciding
+                # whether anything after it is real content.
+                marker = phase2_close_marker or [phase2_close_candidate[0]]
+                common_len = min(len(phase2_close_candidate), len(marker))
+                prefix_matches = (
+                    phase2_close_candidate[:common_len] == marker[:common_len]
                 )
-                if close_idx is None:
-                    phase2_pending.append(go)
-                    if out_py.finished:
-                        # No close ever — buffered chunks are all content.
-                        for item in _flush_phase2_pending():
-                            yield item
-                        phase2_pending = []
-                    continue
+                if not prefix_matches:
+                    # Preserve the old all-or-none suffix behavior: when the
+                    # configured tail does not match, only the close head is
+                    # structural and the remaining candidate is content.
+                    post_close = list(phase2_close_candidate[1:])
+                elif len(phase2_close_candidate) < len(marker):
+                    if not out_py.finished:
+                        continue
+                    # Keep the old all-or-none suffix behavior at EOF: a
+                    # partial marker tail is content, not structural output.
+                    post_close = list(phase2_close_candidate[1:])
+                else:
+                    post_close = list(phase2_close_candidate[len(marker) :])
 
                 if post_close:
                     # Case A: discard pending + emit post-close.
                     phase2_pending = []
                     phase2_seen_close = True
+                    phase2_close_candidate = None
                     if out_py.finished and runtime.eos_tokens:
                         post_close = _strip_trailing_eos(post_close, runtime.eos_tokens)
                     out_py.output_ids = torch.tensor(post_close, dtype=torch.int32)
@@ -1047,19 +1081,18 @@ async def iter_real_model_stream_infer(
                         yield (resp, stats) if yield_access_stats else resp
                 elif out_py.finished:
                     # Case B: pre-close is real content; keep it, drop close.
-                    pre_close = list(generated_ids[:close_idx])
-                    out_py.output_ids = torch.tensor(pre_close, dtype=torch.int32)
-                    phase2_pending.append(go)
+                    if not current_go_in_pending:
+                        out_py.output_ids = torch.tensor([], dtype=torch.int32)
+                        phase2_pending.append(go)
                     for item in _flush_phase2_pending():
                         yield item
                     phase2_pending = []
                     phase2_seen_close = True
+                    phase2_close_candidate = None
                 else:
-                    # Ambiguous: close split across chunks. Default to Case A
-                    # (drop pending + this chunk's pre-close); next chunk's
-                    # content will stream as content normally.
-                    phase2_pending = []
-                    phase2_seen_close = True
+                    # Full marker with no following token yet: wait for either
+                    # content (Case A) or a finished frame (Case B).
+                    continue
             if not phase2_received_finished:
                 await _close_async_stream_if_possible(phase2_stream, phase2_tag)
                 status_message = (
