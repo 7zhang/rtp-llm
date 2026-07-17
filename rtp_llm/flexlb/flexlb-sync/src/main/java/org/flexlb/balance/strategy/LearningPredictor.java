@@ -48,23 +48,27 @@ public class LearningPredictor implements PrefillTimePredictor {
     private final double beta1 = 0.9;
     private final double beta2 = 0.95;
     private final double epsilon = 1e-20;
-    private final double alpha = 0.005;
-    private double coff1 = 0.55;
-    private double coff2 = 1.2;
-    private double coff3 = 1700.0;
+    private final double stable_alpha2 = 1;
+    private double alpha = 0.22;
+    private double coff1 = 0.005;
+    private double coff2 = 0.02;
+    private double coff3 = 320;
     private long t = 1;
     private int batchSize = 4;
     private List<BatchUpdateItem> itemBatch;
 
     public LearningPredictor() {
-        this.weightsRef = new AtomicReference<>(new double[] { 0, 0, 0, 0, 0, 0, 0, 0 });
+        this.weightsRef = new AtomicReference<>(new double[] { -4.40538432604287, 10.522208701202377, 1.5043093890711503,
+                                                               21.40103419118763, 0.11145680735428248, 0.08305932028650383,
+                                                               1.451617309598213, 1.0268830123611967, -4.405384326042869});
         this.linear_param_count = 6;
         this.total_param_count = this.weightsRef.get().length;
         this.adamMoment1 = new double[this.total_param_count];
         this.adamMoment2 = new double[this.total_param_count];
         this.itemBatch = new ArrayList<>();
-        logger.warn("learn predictor created, t: {}, init param: {}, beta1: {}, beta2: {}, alpha: {}, batchSize: {}",
-                this.t, formulaStringParam(this.weightsRef.get()), this.beta1, this.beta2, this.alpha, this.batchSize);
+        logger.warn(
+                "learn predictor created, t: {}, total param {}, init param: {}, beta1: {}, beta2: {}, alpha: {}, batchSize: {}",
+                this.t, this.total_param_count, formulaStringParam(this.weightsRef.get()), this.beta1, this.beta2, this.alpha, this.batchSize);
     }
 
     @Override
@@ -81,8 +85,10 @@ public class LearningPredictor implements PrefillTimePredictor {
         inputs[4] = thisCompute * thisCompute;
         inputs[5] = thisReuse * thisCompute;
         double[] weights = this.weightsRef.get();
-        double linearExp = calcLinearExp(inputs, weights);
-        return (long) calcOutput(weights, linearExp);
+        double linear = calcLinear(inputs, weights);
+        double[] values = new double[5];
+        calcNonLinear(weights, linear, values);
+        return (long) values[0];
     }
 
     @Override
@@ -94,8 +100,10 @@ public class LearningPredictor implements PrefillTimePredictor {
         }
         double[] inputs = this.collectInput(items);
         double[] weights = this.weightsRef.get();
-        double linearExp = calcLinearExp(inputs, weights);
-        return calcOutput(weights, linearExp);
+        double linear = calcLinear(inputs, weights);
+        double[] values = new double[5];
+        calcNonLinear(weights, linear, values);
+        return values[0];
     }
 
     @Override
@@ -104,17 +112,55 @@ public class LearningPredictor implements PrefillTimePredictor {
         return predictBatchMs(items);
     }
 
-    private double calcLinearExp(double[] inputs, double[] weights) {
+    private double calcLinear(double[] inputs, double[] weights) {
         double sum = 0.0;
         for (int i = 0; i < inputs.length; i++) {
             sum += inputs[i] * weights[i];
         }
-        return Math.exp(sum / this.coff3);
+        return sum / this.coff3;
     }
 
-    private double calcOutput(double[] weights, double linearExp) {
-        return weights[this.linear_param_count] / this.coff1 +
-                weights[this.linear_param_count + 1] / this.coff2 * linearExp;
+    public void calcNonLinear(double[] weights, double linearOutput, double[] output) {
+        calcNonLinearFast(weights, linearOutput, output);
+    }
+
+    public void calcNonLinearFast(double[] weights, double linearOutput, double[] output) {
+        // param6 / coff1 + param7 / coff2 * ((linear + 1 + p8) + Sqrt((linear + 1 + p8)^2 + 4))
+        double p6 = weights[this.linear_param_count] / this.coff1;
+        double p7 = weights[this.linear_param_count + 1] / this.coff2;
+        double p8 = weights[this.linear_param_count + 2] + 1.0;
+        double linearAddP8 = linearOutput + p8;
+        double sqrt_value = Math.sqrt(linearAddP8 * linearAddP8 + 4.0);
+        double non_linear_value = linearAddP8 + sqrt_value;
+        double predict = p6 + p7 * non_linear_value;
+        double grad = p7 * (1.0 + linearAddP8 / sqrt_value);
+        double p6_grad = 1.0 / this.coff1;
+        double p7_grad = non_linear_value / this.coff2;
+        double p8_grad = grad;
+        output[0] = predict;
+        output[1] = grad;
+        output[2] = p6_grad;
+        output[3] = p7_grad;
+        output[4] = p8_grad;
+    }
+
+    public void calcNonLinearExp(double[] weights, double linearOutput, double[] output) {
+        // param6 / coff1 + param7 / coff2 * Log(1 + (1 + param8) * Exp(linear))
+        double p6 = weights[this.linear_param_count] / this.coff1;
+        double p7 = weights[this.linear_param_count + 1] / this.coff2;
+        double p8 = weights[this.linear_param_count + 2] + 1;
+        double exp_value = Math.exp(linearOutput);
+        double non_linear_value = Math.log(1.0 + p8 * exp_value);
+        double predict = p6 + p7 * non_linear_value;
+        double grad = p7 * p8 / (p8 + Math.exp(-linearOutput));
+        double p6_grad = 1.0 / this.coff1;
+        double p7_grad = non_linear_value / this.coff2;
+        double p8_grad = p7 * exp_value / (1.0 + p8 * exp_value);
+        output[0] = predict;
+        output[1] = grad;
+        output[2] = p6_grad;
+        output[3] = p7_grad;
+        output[4] = p8_grad;
     }
 
     private double[] collectInput(List<BatchItem> items) {
@@ -132,7 +178,7 @@ public class LearningPredictor implements PrefillTimePredictor {
             compute_square += thisCompute * thisCompute;
             reuse_mul_compute += thisReuse * thisCompute;
         }
-        double[] inputs = new double[this.total_param_count];
+        double[] inputs = new double[this.linear_param_count];
         inputs[0] = 1.0;
         inputs[1] = (double) items.size();
         inputs[2] = reuse;
@@ -157,18 +203,48 @@ public class LearningPredictor implements PrefillTimePredictor {
         this.weightsRef.updateAndGet(oldWeights -> {
             double[] gradient = new double[this.total_param_count];
             for (BatchUpdateItem batchItem : this.itemBatch) {
+                double[] thisGradient = new double[this.total_param_count];
                 double[] inputs = this.collectInput(batchItem.getItem());
-                double linearExp = calcLinearExp(inputs, oldWeights);
-                double predict = calcOutput(oldWeights, linearExp);
-                double diff = predict - batchItem.getActualMs();
-                gradient[this.linear_param_count] += diff / this.coff1;
-                gradient[this.linear_param_count + 1] += diff / this.coff2 * linearExp;
-                double linearGrad = diff * oldWeights[this.linear_param_count + 1] / this.coff2 * linearExp
-                        / this.coff3;
-                gradient[0] = linearGrad;
-                for (int i = 1; i < oldWeights.length; i++) {
-                    gradient[i] += linearGrad * inputs[i];
+                double linear = calcLinear(inputs, oldWeights);
+                double[] nonLinearOutput = new double[5];
+                calcNonLinear(oldWeights, linear, nonLinearOutput);
+                double predict = nonLinearOutput[0];
+                double nonLinearGrad = nonLinearOutput[1];
+                double nonLinearP6Grad = nonLinearOutput[2];
+                double nonLinearP7Grad = nonLinearOutput[3];
+                double nonLinearP8Grad = nonLinearOutput[4];
+                thisGradient[this.linear_param_count] = nonLinearP6Grad;
+                thisGradient[this.linear_param_count + 1] = nonLinearP7Grad;
+                thisGradient[this.linear_param_count + 2] = nonLinearP8Grad;
+                double linearGrad = nonLinearGrad / this.coff3;
+                for (int i = 0; i < inputs.length; i++) {
+                    thisGradient[i] = linearGrad * inputs[i];
                 }
+                // check grad
+                boolean checkGrad = false;
+                if (checkGrad) {
+                    for (int j = 0; j < oldWeights.length; j++) {
+                        double[] test_weights = oldWeights.clone();
+                        double test_delta = test_weights[j] != 0 ? Math.max(-10.0, Math.min(10.0, test_weights[j] * 0.0001))
+                            : 1e-6;
+                        test_weights[j] = test_weights[j] + test_delta;
+                        double testLinear = calcLinear(inputs, test_weights);
+                        double[] testNonLinearOutput = new double[5];
+                        calcNonLinear(test_weights, testLinear, testNonLinearOutput);
+                        double evaluateDiff = testNonLinearOutput[0] - predict;
+                        double gradDiff = test_delta * thisGradient[j];
+                        if (Math.abs(gradDiff - evaluateDiff) > Math.abs(evaluateDiff * 0.01)) {
+                            System.out.println("grad check failed for param: " + j
+                                               + ", gradDiff: " + gradDiff + " evaluateDiff: " + evaluateDiff
+                                               + "grads: " + formulaWeights(thisGradient));
+                        }
+                    }
+                }
+                double diff = predict - batchItem.getActualMs();
+                for (int i = 0; i < oldWeights.length; i++) {
+                    gradient[i] += diff * thisGradient[i];
+                }
+                // System.out.println("this gradient: " + formulaStringParam(thisGradient));
             }
             for (int i = 0; i < oldWeights.length; i++) {
                 gradient[i] = gradient[i] / this.batchSize;
@@ -183,14 +259,14 @@ public class LearningPredictor implements PrefillTimePredictor {
                         / (1.0 - Math.pow(this.beta1, this.t))
                         * this.adamMoment1[i] / (Math.sqrt(this.adamMoment2[i] + this.epsilon));
             }
-            /*
-             * System.out.println("t: " + this.t);
-             * System.out.println("gradient: " + formulaStringParam(gradient));
-             * System.out.println("old: " + formulaStringParam(oldWeights));
-             * System.out.println("new: " + formulaStringParam(newWeights));
-             * System.out.println("moment1: " + formulaStringParam(this.adamMoment1));
-             * System.out.println("moment2: " + formulaStringParam(this.adamMoment2));
-             */
+
+            // System.out.println("t: " + this.t);
+            // System.out.println("gradient: " + formulaStringParam(gradient));
+            // System.out.println("old: " + formulaStringParam(oldWeights));
+            // System.out.println("new: " + formulaStringParam(newWeights));
+            // System.out.println("moment1: " + formulaStringParam(this.adamMoment1));
+            // System.out.println("moment2: " + formulaStringParam(this.adamMoment2));
+            // System.out.println("");
             return newWeights;
         });
         this.t = this.t + 1;
@@ -199,6 +275,10 @@ public class LearningPredictor implements PrefillTimePredictor {
     }
 
     // ---- parameter management ----
+
+    public double[] getParams() {
+        return weightsRef.get();
+    }
 
     public double getParameter(String name) {
         int idx = weightIndex(name);
@@ -214,10 +294,11 @@ public class LearningPredictor implements PrefillTimePredictor {
         });
     }
 
-    public void setCoff(double coff1, double coff2, double coff3) {
+    public void setCoff(double coff1, double coff2, double coff3, double alpha) {
         this.coff1 = coff1;
         this.coff2 = coff2;
         this.coff3 = coff3;
+        this.alpha = alpha;
     }
 
     public Set<String> parameterNames() {
@@ -253,13 +334,16 @@ public class LearningPredictor implements PrefillTimePredictor {
         return result;
     }
 
-    public String formulaString() {
-        double[] weights = this.weightsRef.get();
+    private String formulaWeights(double[] weights) {
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < weights.length; i++) {
             if (i > 0) sb.append(", ");
             sb.append("w").append(i).append("=").append(weights[i]);
         }
         return sb.toString();
+    }
+
+    public String formulaString() {
+        return formulaWeights(this.weightsRef.get());
     }
 }
